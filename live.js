@@ -133,18 +133,22 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
   #video-container {
     position: relative; width: 100%; max-width: 1280px;
     background: #111; border-radius: 8px; overflow: hidden;
-    aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center;
+    aspect-ratio: 16/9;
   }
   video {
     width: 100%; height: 100%; object-fit: contain; background: #000;
   }
   #start-btn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     padding: 14px 32px; font-size: 18px; font-weight: 600;
     background: #e53e3e; color: white; border: none; border-radius: 8px;
-    cursor: pointer; transition: background 0.2s;
+    cursor: pointer; transition: background 0.2s; z-index: 2;
   }
   #start-btn:hover { background: #c53030; }
-  #waiting { color: #888; font-size: 16px; }
+  #waiting {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #888; font-size: 16px;
+  }
   #info { margin-top: 12px; font-size: 13px; color: #666; text-align: center; }
   #viewers-count { position: fixed; top: 0; right: 16px; padding: 10px; font-size: 13px; color: #999; z-index: 11; }
 </style>
