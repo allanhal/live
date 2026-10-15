@@ -145,6 +145,13 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
     cursor: pointer; transition: background 0.2s; z-index: 2;
   }
   #start-btn:hover { background: #c53030; }
+  #unmute-btn {
+    position: absolute; bottom: 16px; right: 16px;
+    padding: 8px 16px; font-size: 14px; font-weight: 600;
+    background: #e53e3e; color: white; border: none; border-radius: 6px;
+    cursor: pointer; z-index: 3; display: none;
+  }
+  #unmute-btn:hover { background: #c53030; }
   #waiting {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     color: #888; font-size: 16px;
@@ -162,6 +169,7 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
   <button id="start-btn" style="display:none">Share Screen</button>
   <video id="video" autoplay playsinline></video>
   <div id="waiting" style="display:none">Waiting for stream...</div>
+  <button id="unmute-btn">🔇 Click to unmute</button>
 </div>
 
 <div id="info"></div>
@@ -174,6 +182,7 @@ const statusEl = document.getElementById("status");
 const waitingEl = document.getElementById("waiting");
 const infoEl = document.getElementById("info");
 const viewersEl = document.getElementById("viewers-count");
+const unmuteBtn = document.getElementById("unmute-btn");
 
 let role = null;
 let ws = null;
@@ -398,9 +407,12 @@ async function handleOffer(offer) {
 
   viewerPC.ontrack = (e) => {
     video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    video.muted = true;
     waitingEl.style.display = "none";
     setStatus("green", "Watching stream");
-    video.play().catch(() => {});
+    video.play().then(() => {
+      unmuteBtn.style.display = "block";
+    }).catch(() => {});
   };
 
   viewerPC.onicecandidate = (e) => {
@@ -414,6 +426,12 @@ async function handleOffer(offer) {
   await viewerPC.setLocalDescription(answer);
   ws.send(JSON.stringify({ type: "answer", data: viewerPC.localDescription }));
 }
+
+unmuteBtn.addEventListener("click", () => {
+  video.muted = false;
+  unmuteBtn.textContent = "🔊 Sound on";
+  setTimeout(() => { unmuteBtn.style.display = "none"; }, 1500);
+});
 
 // --- UI helpers ---
 
