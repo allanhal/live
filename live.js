@@ -281,9 +281,6 @@ startBtn.addEventListener("click", async () => {
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 },
     });
 
-    // Tell the encoder this is fast-motion content (gaming)
-    localStream.getVideoTracks()[0].contentHint = "motion";
-
     video.srcObject = localStream;
     video.muted = true;
     startBtn.style.display = "none";
@@ -308,16 +305,6 @@ async function createPeerForViewer(viewerId) {
 
   for (const track of localStream.getTracks()) {
     pc.addTrack(track, localStream);
-  }
-
-  // Prioritize frame rate over resolution for gaming
-  const videoSender = pc.getSenders().find(s => s.track && s.track.kind === "video");
-  if (videoSender) {
-    const params = videoSender.getParameters();
-    if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-    params.encodings[0].maxBitrate = QUALITY_TIERS[currentTierIndex].maxBitrate;
-    params.degradationPreference = "maintain-framerate";
-    await videoSender.setParameters(params);
   }
 
   pc.onicecandidate = (e) => {
