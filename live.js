@@ -210,9 +210,14 @@ function connect() {
       case "role":
         role = msg.role;
         if (role === "broadcaster") {
-          startBtn.style.display = "block";
           waitingEl.style.display = "none";
-          setStatus("yellow", "Ready to broadcast — click Share Screen");
+          if (localStream) {
+            startBtn.style.display = "none";
+            setStatus("green", "Broadcasting");
+          } else {
+            startBtn.style.display = "block";
+            setStatus("yellow", "Ready to broadcast — click Share Screen");
+          }
           infoEl.textContent = "Share this URL with viewers: " + location.href;
         } else {
           startBtn.style.display = "none";
@@ -411,7 +416,7 @@ async function handleOffer(offer) {
     waitingEl.style.display = "none";
     setStatus("green", "Watching stream");
     video.play().then(() => {
-      unmuteBtn.style.display = "block";
+      if (role === "viewer") unmuteBtn.style.display = "block";
     }).catch(() => {});
   };
 
