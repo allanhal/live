@@ -4,6 +4,7 @@ const express = require("express");
 const { WebSocketServer } = require("ws");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || "https://live.allanpinheiro.com";
 
 const app = express();
 const server = http.createServer(app);
@@ -91,15 +92,49 @@ function idFor(ws) {
   return wsIds.get(ws);
 }
 
+// --- Room IDs ---
+
+// Short, speakable slugs like "swift-otter-24" so a room can be read out loud
+// or typed from memory instead of copied character by character.
+const ADJECTIVES = [
+  "amber", "brave", "bright", "calm", "clever", "crisp", "daring", "eager",
+  "fair", "fancy", "gentle", "glad", "golden", "happy", "jolly", "keen",
+  "kind", "lively", "lucky", "merry", "mighty", "neat", "noble", "plucky",
+  "proud", "quick", "quiet", "rapid", "royal", "sharp", "shiny", "silver",
+  "smart", "snappy", "solid", "spry", "sunny", "swift", "tidy", "tough",
+  "vivid", "warm", "wise", "witty", "zesty",
+];
+
+const NOUNS = [
+  "otter", "falcon", "tiger", "panda", "koala", "heron", "lynx", "raven",
+  "bison", "cobra", "dingo", "eagle", "ferret", "gecko", "hawk", "ibis",
+  "jaguar", "kiwi", "lemur", "moose", "newt", "orca", "puffin", "quail",
+  "rabbit", "salmon", "shark", "sloth", "stork", "swan", "tapir", "toucan",
+  "turtle", "viper", "walrus", "weasel", "wombat", "yak", "zebra", "badger",
+  "beaver", "camel", "crane", "donkey", "marmot",
+];
+
+function newRoomId() {
+  const pick = (arr) => arr[crypto.randomInt(arr.length)];
+  return pick(ADJECTIVES) + "-" + pick(NOUNS) + "-" + crypto.randomInt(10, 100);
+}
+
+// Any room id reaching :roomId is interpolated into the page, so keep it to a
+// charset that cannot break out of the HTML or the JS string literal. Staying
+// permissive lets people pick their own room, e.g. /standup.
+const ROOM_ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
 // --- HTTP routes ---
 
 app.get("/", (_req, res) => {
-  const roomId = crypto.randomBytes(4).toString("hex");
-  res.redirect(`/${roomId}`);
+  res.redirect(`/${newRoomId()}`);
 });
 
 app.get("/:roomId", (req, res) => {
-  const { roomId } = req.params;
+  const roomId = req.params.roomId.toLowerCase();
+  if (!ROOM_ID_RE.test(roomId)) return res.status(404).type("text").send("Not found");
+  // Canonicalise so the URL people share is the one the room is keyed on.
+  if (roomId !== req.params.roomId) return res.redirect(`/${roomId}`);
   res.type("html").send(PAGE_HTML.replace(/__ROOM_ID__/g, roomId));
 });
 
@@ -457,13 +492,14 @@ connect();
 </html>`;
 
 server.listen(PORT, () => {
-  const roomId = crypto.randomBytes(4).toString("hex");
+  const roomId = newRoomId();
   console.log("");
   console.log("  Live stream server running!");
   console.log("");
   console.log("  Local:   http://localhost:" + PORT + "/" + roomId);
+  console.log("  Public:  " + PUBLIC_ORIGIN + "/" + roomId);
   console.log("");
-  console.log("  Open the link above to start broadcasting.");
-  console.log("  Share the same path on your public domain for viewers.");
+  console.log("  Open the local link to start broadcasting,");
+  console.log("  then share the public link with viewers.");
   console.log("");
 });
