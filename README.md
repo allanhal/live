@@ -78,11 +78,20 @@ A 1-broadcaster/50-viewer room costs the server well under a megabyte in total, 
 
 Note that two people cannot broadcast into the *same* room — the first joiner takes the broadcaster slot and the rest become viewers. Multiple streamers means multiple rooms.
 
+## Room lifecycle
+
+Rooms live only in memory and only while someone is in them. A room is created when the first client sends `join` — not when a socket connects — and deleted as soon as the last participant leaves.
+
+Dead clients are reaped by a 30s ping/pong heartbeat (`HEARTBEAT_MS`): a laptop that sleeps or a connection that drops without a TCP teardown never fires `close`, so without this its room would stay keyed to a broadcaster who is never coming back, and the next person to open the URL would join as a viewer of nothing. The same timer sweeps any room left empty.
+
+A broadcaster leaving does **not** evict the viewers — they stay connected and waiting, the room survives, and the broadcaster slot is free for whoever takes it next.
+
+`GET /healthz` reports `{ ok, rooms, clients, uptime }`.
+
 ## Known limitations
 
 - **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. Past a handful of viewers this needs simulcast or an SFU.
 - **STUN only, no TURN.** On symmetric NAT or a corporate network the peer connection simply fails, with no relay to fall back on. Adding TURN fixes it but puts video bandwidth on a server.
-- **No WebSocket heartbeat.** A client that disappears without a TCP teardown keeps its slot. If that client was the broadcaster, the room stays occupied and the next person to open the URL becomes a viewer of nothing.
 - **Viewers who arrive early get nothing.** `viewer-joined` requires `localStream` to already exist, and the Share Screen handler does not loop back over viewers who joined before it, so they wait forever.
 - **The adaptive bitrate controller only ratchets down.** It compares measured throughput against a target nobody set on the sender, so the test is true from the start and quality falls to the lowest tier within ~20 seconds regardless of the network — then cannot climb back, because recovery requires saturating a bitrate the encoder was never aimed at.
 - **Deployment is manual.** Nothing in the repo provisions `live.allanpinheiro.com`; the process has to be run and fronted by TLS somewhere. WebRTC screen capture requires a secure context, so plain HTTP only works on `localhost`.

@@ -23,14 +23,59 @@ function cleanRoom(id) {
   if (room && !room.broadcaster && room.viewers.size === 0) rooms.delete(id);
 }
 
+// ws.send() on an already-closed socket emits "error", and an "error" with no
+// listener throws. Both matter once we start terminating dead sockets.
+function send(ws, payload) {
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+}
+
+// --- Reaping idle rooms ---
+
+// A client that vanishes without a TCP FIN (laptop sleeps, wifi drops) never
+// fires "close", so its room stays keyed to a broadcaster who is not coming
+// back and the next person to open the URL joins as a viewer of nothing.
+// Ping every round and drop anything that missed the previous one; the close
+// handler then cleans the room normally. The sweep is a backstop for rooms
+// created by getRoom() that never reached a close.
+const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || "30000", 10);
+
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+
+  for (const [id, room] of rooms) {
+    if (!room.broadcaster && room.viewers.size === 0) {
+      rooms.delete(id);
+      console.log(`[${id}] room reaped (empty)`);
+    }
+  }
+}, HEARTBEAT_MS);
+
+heartbeat.unref();
+wss.on("close", () => clearInterval(heartbeat));
+
 // --- WebSocket signaling ---
 
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("error", () => ws.terminate());
+
   const url = new URL(req.url, "http://localhost");
   const roomId = url.searchParams.get("room");
   if (!roomId) return ws.close(4000, "missing room");
 
-  const room = getRoom(roomId);
+  // Resolved on join rather than on connect. A socket that never joins should
+  // not conjure a room, and a room created here could be swept before the join
+  // arrived, leaving this socket holding an object no longer in `rooms` while
+  // the next person to join the same URL got a different one.
+  let room = null;
   let role = null;
 
   ws.on("message", (raw) => {
@@ -39,16 +84,18 @@ wss.on("connection", (ws, req) => {
 
     switch (msg.type) {
       case "join": {
+        if (room) break;
+        room = getRoom(roomId);
         if (!room.broadcaster) {
           role = "broadcaster";
           room.broadcaster = ws;
-          ws.send(JSON.stringify({ type: "role", role: "broadcaster" }));
+          send(ws, { type: "role", role: "broadcaster" });
           console.log(`[${roomId}] broadcaster connected`);
         } else {
           role = "viewer";
           room.viewers.add(ws);
-          ws.send(JSON.stringify({ type: "role", role: "viewer" }));
-          room.broadcaster.send(JSON.stringify({ type: "viewer-joined", viewerId: idFor(ws) }));
+          send(ws, { type: "role", role: "viewer" });
+          send(room.broadcaster, { type: "viewer-joined", viewerId: idFor(ws) });
           console.log(`[${roomId}] viewer connected (${room.viewers.size} total)`);
         }
         break;
@@ -57,11 +104,12 @@ wss.on("connection", (ws, req) => {
       case "offer":
       case "answer":
       case "ice-candidate": {
+        if (!room) break;
         if (role === "broadcaster" && msg.viewerId) {
           const target = [...room.viewers].find((v) => idFor(v) === msg.viewerId);
-          if (target) target.send(JSON.stringify({ type: msg.type, data: msg.data }));
+          if (target) send(target, { type: msg.type, data: msg.data });
         } else if (role === "viewer" && room.broadcaster) {
-          room.broadcaster.send(JSON.stringify({ type: msg.type, data: msg.data, viewerId: idFor(ws) }));
+          send(room.broadcaster, { type: msg.type, data: msg.data, viewerId: idFor(ws) });
         }
         break;
       }
@@ -69,15 +117,18 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    if (!room) return;
     if (role === "broadcaster") {
       room.broadcaster = null;
-      for (const v of room.viewers) v.send(JSON.stringify({ type: "broadcaster-left" }));
-      room.viewers.clear();
-      console.log(`[${roomId}] broadcaster disconnected`);
+      for (const v of room.viewers) send(v, { type: "broadcaster-left" });
+      // Keep the viewers: they are still connected and waiting, and clearing
+      // them here deleted the room out from under them, so a returning
+      // broadcaster got a fresh room object the old viewers were not in.
+      console.log(`[${roomId}] broadcaster disconnected (${room.viewers.size} viewers waiting)`);
     } else if (role === "viewer") {
       room.viewers.delete(ws);
       if (room.broadcaster) {
-        room.broadcaster.send(JSON.stringify({ type: "viewer-left", viewerId: idFor(ws) }));
+        send(room.broadcaster, { type: "viewer-left", viewerId: idFor(ws) });
       }
       console.log(`[${roomId}] viewer disconnected (${room.viewers.size} remaining)`);
     }
@@ -128,6 +179,16 @@ const ROOM_ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
 app.get("/", (_req, res) => {
   res.redirect(`/${newRoomId()}`);
+});
+
+// Registered before :roomId, which would otherwise match "healthz" as a room.
+app.get("/healthz", (_req, res) => {
+  res.json({
+    ok: true,
+    rooms: rooms.size,
+    clients: wss.clients.size,
+    uptime: Math.round(process.uptime()),
+  });
 });
 
 app.get("/:roomId", (req, res) => {
