@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>live — transmissão de tela P2P</title>
+<meta name="description" content="Compartilhe sua tela ao vivo pelo navegador. O vídeo vai direto de você para quem assiste, sem passar por servidor.">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --surface: #121212;
+    --border: #262626;
+    --text: #e8e8e8;
+    --muted: #8a8a8a;
+    --accent: #e53e3e;
+    --green: #38a169;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.65; font-size: 17px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 16px; }
+  header { padding: 72px 0 56px; border-bottom: 1px solid var(--border); }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--muted); font-family: var(--mono);
+    margin-bottom: 20px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); flex: none;
+  }
+  h1 { font-size: clamp(34px, 8vw, 52px); line-height: 1.1; letter-spacing: -0.02em; }
+  .tagline { font-size: clamp(18px, 4vw, 21px); color: var(--muted); margin-top: 18px; max-width: 34em; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
+  .btn {
+    display: inline-block; padding: 13px 24px; border-radius: 8px;
+    font-size: 16px; font-weight: 600; text-decoration: none;
+    background: var(--accent); color: #fff; border: 1px solid var(--accent);
+  }
+  .btn:hover { background: #c53030; }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--border); }
+  .btn-ghost:hover { background: var(--surface); }
+  section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: 0; }
+  h2 { font-size: clamp(24px, 5vw, 30px); letter-spacing: -0.01em; margin-bottom: 20px; }
+  h3 { font-size: 18px; margin-bottom: 6px; }
+  p { margin-bottom: 16px; max-width: 38em; }
+  p:last-child { margin-bottom: 0; }
+  ol.steps { list-style: none; counter-reset: s; display: grid; gap: 22px; }
+  ol.steps li { counter-increment: s; display: grid; grid-template-columns: 38px 1fr; gap: 16px; }
+  ol.steps li::before {
+    content: counter(s); grid-row: span 2;
+    width: 38px; height: 38px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--surface); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 15px; color: var(--accent);
+  }
+  ol.steps p { color: var(--muted); margin: 0; font-size: 16px; }
+  code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 5px; padding: 2px 6px; word-break: break-all;
+  }
+  pre {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; overflow-x: auto; margin-bottom: 16px;
+  }
+  pre code { background: none; border: 0; padding: 0; word-break: normal; }
+  .diagram {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px 12px; overflow-x: auto; margin-bottom: 18px;
+  }
+  .diagram svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+  .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px;
+  }
+  .card p { font-size: 15px; color: var(--muted); margin: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; margin-bottom: 16px; }
+  th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); }
+  th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+  td:first-child { color: var(--muted); }
+  .note {
+    border-left: 3px solid var(--accent); padding: 4px 0 4px 16px;
+    color: var(--muted); font-size: 16px;
+  }
+  ul.plain { list-style: none; display: grid; gap: 14px; }
+  ul.plain li { padding-left: 20px; position: relative; color: var(--muted); font-size: 16px; }
+  ul.plain li::before { content: "—"; position: absolute; left: 0; color: var(--accent); }
+  ul.plain strong { color: var(--text); }
+  footer { padding: 44px 0 64px; color: var(--muted); font-size: 15px; }
+  footer a { color: var(--text); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="badge"><span class="dot"></span> live.allanpinheiro.com</div>
+    <h1>Transmita sua tela<br>direto do navegador.</h1>
+    <p class="tagline">
+      Abra um link, compartilhe a tela, mande o endereço para quem vai assistir.
+      Sem instalar nada, sem criar conta — e o vídeo nunca passa por um servidor.
+    </p>
+    <div class="cta">
+      <a class="btn" href="https://live.allanpinheiro.com">Abrir uma sala</a>
+      <a class="btn btn-ghost" href="https://github.com/allanhal/live">Código no GitHub</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Como usar</h2>
+    <ol class="steps">
+      <li>
+        <h3>Abra <code>live.allanpinheiro.com</code></h3>
+        <p>Você cai numa sala nova com um endereço fácil de ler, do tipo <code>swift-otter-24</code>. Dá para ditar por telefone.</p>
+      </li>
+      <li>
+        <h3>Clique em “Share Screen”</h3>
+        <p>O navegador pergunta qual tela, janela ou aba você quer transmitir. Quem abre a sala primeiro é quem transmite.</p>
+      </li>
+      <li>
+        <h3>Mande o link</h3>
+        <p>Todo mundo que abrir o mesmo endereço entra como espectador e começa a ver sua tela. Sem sala de espera, sem aprovação.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Por onde o vídeo passa</h2>
+    <p>
+      O servidor faz uma coisa só: apresentar os participantes uns aos outros. Ele troca os
+      dados de conexão (SDP e candidatos ICE) e sai do caminho. O vídeo vai de você
+      direto para quem assiste, por WebRTC.
+    </p>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    subgraph sala["Sala swift-otter-24"]
+        B["Quem transmite<br/>captura da tela 1080p60"]
+        V1["Espectador 1"]
+        V2["Espectador 2"]
+    end
+
+    subgraph srv["Servidor — live.allanpinheiro.com"]
+        EX["Express<br/>entrega a página da sala"]
+        WSS["WebSocket<br/>repassa SDP e ICE"]
+        RM[("salas em memória")]
+        WSS <--> RM
+    end
+
+    B -. "abre a página" .-> EX
+    V1 -. "abre a página" .-> EX
+    V2 -. "abre a página" .-> EX
+
+    B -. "negociação" .-> WSS
+    V1 -. "negociação" .-> WSS
+    V2 -. "negociação" .-> WSS
+
+    B ==>|"vídeo — não passa pelo servidor"| V1
+    B ==>|"vídeo — não passa pelo servidor"| V2
+
+    classDef server fill:#1e3a5f,stroke:#4a90d9,color:#e8f0f8
+    classDef bcast fill:#5f1e1e,stroke:#d94a4a,color:#f8e8e8
+    classDef viewer fill:#1e4a2e,stroke:#4ad97a,color:#e8f8ee
+    class EX,WSS,RM server
+    class B bcast
+    class V1,V2 viewer
+      </pre>
+    </div>
+    <p class="note">
+      As linhas pontilhadas são o único tráfego que o servidor vê. As linhas grossas são
+      o vídeo, e elas vão ponto a ponto.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>O que isso significa na prática</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Privacidade</h3>
+        <p>Sua tela não é gravada nem armazenada em nenhum lugar. Não existe cópia no servidor porque o vídeo não chega até ele.</p>
+      </div>
+      <div class="card">
+        <h3>Latência baixa</h3>
+        <p>Um salto só entre você e quem assiste, sem fila de transcodificação no meio.</p>
+      </div>
+      <div class="card">
+        <h3>Servidor barato</h3>
+        <p>Dez salas simultâneas custam praticamente o mesmo que uma. O custo cresce com o número de pessoas, não com a qualidade do vídeo.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Quem paga a conta</h2>
+    <p>
+      Como o vídeo sai direto da sua máquina, é o seu computador e a sua internet que
+      sustentam a transmissão — uma codificação de vídeo separada para cada espectador.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Custo</th><th>Servidor</th><th>Quem transmite</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Por sala</td><td>uma entrada em memória</td><td>—</td></tr>
+        <tr><td>Por pessoa</td><td>um WebSocket, ~10 KB uma vez</td><td>—</td></tr>
+        <tr><td>Por espectador</td><td>nada depois da conexão</td><td>uma codificação + upload inteiros</td></tr>
+        <tr><td>Cresce com a qualidade</td><td>não</td><td>sim</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Na prática: uma sala com 50 espectadores custa menos de um megabyte ao servidor no
+      total, e custa a você algo em torno de 125 Mbps de upload. É por isso que o projeto
+      funciona bem para um grupo pequeno e precisa de outra arquitetura para plateia grande.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Limitações conhecidas</h2>
+    <ul class="plain">
+      <li><strong>Uma pessoa transmite por sala.</strong> Quem entra primeiro vira o transmissor; o resto entra como espectador. Para duas transmissões, use duas salas.</li>
+      <li><strong>Redes corporativas podem bloquear.</strong> A conexão usa só STUN, sem servidor de retransmissão (TURN). Em redes com NAT simétrico a conexão ponto a ponto simplesmente não fecha.</li>
+      <li><strong>Quem chega antes espera.</strong> Espectadores que abrem a sala antes de você clicar em “Share Screen” não recebem o vídeo quando a transmissão começa.</li>
+      <li><strong>Plateia pequena.</strong> Sem simulcast nem servidor de mídia, cada espectador adicional é mais uma codificação completa na sua máquina.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Projeto aberto, um arquivo só.
+    <a href="https://github.com/allanhal/live">github.com/allanhal/live</a> ·
+    roda em <a href="https://live.allanpinheiro.com">live.allanpinheiro.com</a>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.1/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "dark",
+    themeVariables: { background: "#121212", fontSize: "14px" },
+  });
+</script>
+</body>
+</html>
