@@ -71,11 +71,22 @@
     border-radius: 8px; padding: 16px; overflow-x: auto; margin-bottom: 16px;
   }
   pre code { background: none; border: 0; padding: 0; word-break: normal; }
-  .diagram {
+  .diagram { margin-bottom: 18px; }
+  .diagram svg {
+    display: block; width: 100%; max-width: 100%; height: auto;
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 20px 12px; overflow-x: auto; margin-bottom: 18px;
+    border-radius: 8px; padding: 12px 8px; color: var(--text);
   }
-  .diagram svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+  .diagram text { font-family: inherit; fill: currentColor; }
+  .t-title { font-size: 13px; font-weight: 600; text-anchor: middle; }
+  .t-sub { font-size: 11px; text-anchor: middle; fill-opacity: 0.55; }
+  .t-edge { font-size: 11px; fill: var(--muted); }
+  .t-vid { font-size: 12px; font-weight: 600; text-anchor: middle; fill: var(--accent); }
+  .t-vid-sub { font-size: 11px; text-anchor: middle; fill: var(--accent); fill-opacity: 0.7; }
+  figcaption {
+    margin-top: 12px; font-size: 15px; color: var(--muted);
+    border-left: 3px solid var(--accent); padding: 2px 0 2px 16px;
+  }
   .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
   .card {
     background: var(--surface); border: 1px solid var(--border);
@@ -144,45 +155,69 @@
       dados de conexão (SDP e candidatos ICE) e sai do caminho. O vídeo vai de você
       direto para quem assiste, por WebRTC.
     </p>
-    <div class="diagram">
-      <pre class="mermaid">
-flowchart LR
-    subgraph sala["Sala swift-otter-24"]
-        B["Quem transmite<br/>captura da tela 1080p60"]
-        V1["Espectador 1"]
-        V2["Espectador 2"]
-    end
+    <figure class="diagram">
+      <svg viewBox="0 0 720 350" role="img"
+           aria-label="O vídeo vai do transmissor direto para os espectadores; o servidor troca apenas mensagens de negociação com os dois lados.">
+        <defs>
+          <marker id="sig" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#8a8a8a"></path>
+          </marker>
+          <marker id="vid" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="4.5" markerHeight="4.5" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#e53e3e"></path>
+          </marker>
+        </defs>
 
-    subgraph srv["Servidor — live.allanpinheiro.com"]
-        EX["Express<br/>entrega a página da sala"]
-        WSS["WebSocket<br/>repassa SDP e ICE"]
-        RM[("salas em memória")]
-        WSS <--> RM
-    end
+        <!-- servidor -->
+        <rect x="230" y="22" width="260" height="74" rx="8"
+              fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-opacity="0.22"></rect>
+        <text class="t-title" x="360" y="47">Servidor</text>
+        <text class="t-sub"   x="360" y="66">live.allanpinheiro.com</text>
+        <text class="t-sub"   x="360" y="83">só repassa SDP e ICE</text>
 
-    B -. "abre a página" .-> EX
-    V1 -. "abre a página" .-> EX
-    V2 -. "abre a página" .-> EX
+        <!-- quem transmite -->
+        <rect x="24" y="190" width="176" height="78" rx="8"
+              fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-opacity="0.22"></rect>
+        <text class="t-title" x="112" y="219">Você</text>
+        <text class="t-sub"   x="112" y="238">captura da tela</text>
+        <text class="t-sub"   x="112" y="255">1080p60</text>
 
-    B -. "negociação" .-> WSS
-    V1 -. "negociação" .-> WSS
-    V2 -. "negociação" .-> WSS
+        <!-- quem assiste -->
+        <rect x="466" y="150" width="230" height="172" rx="10"
+              fill="none" stroke="currentColor" stroke-opacity="0.14" stroke-dasharray="3 4"></rect>
+        <text class="t-sub" x="581" y="172">Quem assiste</text>
+        <rect x="488" y="186" width="186" height="56" rx="8"
+              fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-opacity="0.22"></rect>
+        <text class="t-title" x="581" y="219">Espectador 1</text>
+        <rect x="488" y="252" width="186" height="56" rx="8"
+              fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-opacity="0.22"></rect>
+        <text class="t-title" x="581" y="285">Espectador 2</text>
 
-    B ==>|"vídeo — não passa pelo servidor"| V1
-    B ==>|"vídeo — não passa pelo servidor"| V2
+        <!-- negociação: dos dois lados para o servidor -->
+        <line x1="112" y1="190" x2="296" y2="98"
+              stroke="#8a8a8a" stroke-width="1.5" stroke-dasharray="4 4"
+              marker-start="url(#sig)" marker-end="url(#sig)"></line>
+        <text class="t-edge" x="196" y="136" text-anchor="end">negociação</text>
 
-    classDef server fill:#1e3a5f,stroke:#4a90d9,color:#e8f0f8
-    classDef bcast fill:#5f1e1e,stroke:#d94a4a,color:#f8e8e8
-    classDef viewer fill:#1e4a2e,stroke:#4ad97a,color:#e8f8ee
-    class EX,WSS,RM server
-    class B bcast
-    class V1,V2 viewer
-      </pre>
-    </div>
-    <p class="note">
-      As linhas pontilhadas são o único tráfego que o servidor vê. As linhas grossas são
-      o vídeo, e elas vão ponto a ponto.
-    </p>
+        <line x1="581" y1="150" x2="424" y2="98"
+              stroke="#8a8a8a" stroke-width="1.5" stroke-dasharray="4 4"
+              marker-start="url(#sig)" marker-end="url(#sig)"></line>
+        <text class="t-edge" x="516" y="124" text-anchor="start">negociação</text>
+
+        <!-- vídeo: direto, sem passar pelo servidor -->
+        <line x1="200" y1="218" x2="482" y2="202"
+              stroke="#e53e3e" stroke-width="3" marker-end="url(#vid)"></line>
+        <line x1="200" y1="244" x2="482" y2="288"
+              stroke="#e53e3e" stroke-width="3" marker-end="url(#vid)"></line>
+        <text class="t-vid" x="312" y="234">vídeo ao vivo</text>
+        <text class="t-vid-sub" x="312" y="250">ponto a ponto</text>
+      </svg>
+      <figcaption>
+        O vídeo sai de você direto para cada espectador. O servidor só participa do
+        aperto de mão inicial — ele nunca recebe um quadro sequer.
+      </figcaption>
+    </figure>
   </div>
 </section>
 
@@ -251,16 +286,5 @@ flowchart LR
     roda em <a href="https://live.allanpinheiro.com">live.allanpinheiro.com</a>
   </div>
 </footer>
-
-<script type="module">
-  // Mermaid 11 ships ESM only; its bundled script build exports to a private
-  // global, so the module import is the supported entry point.
-  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
-  mermaid.initialize({
-    startOnLoad: true,
-    theme: "dark",
-    themeVariables: { background: "#121212", fontSize: "14px" },
-  });
-</script>
 </body>
 </html>

@@ -26,38 +26,30 @@ You can also just pick your own: `/standup` or `/demo-friday` works. Any id is l
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph roomA["Room swift-otter-24"]
-        BA["Broadcaster A<br/>getDisplayMedia 1080p60<br/>one encode per viewer"]
-        VA1["Viewer A1"]
-        VA2["Viewer A2"]
-    end
-
+flowchart TB
     subgraph srv["Node process — live.js — live.allanpinheiro.com"]
-        EX["Express<br/>GET / → redirect to random room<br/>GET /:roomId → PAGE_HTML"]
-        WSS["WebSocketServer<br/>relays join / offer / answer / ice-candidate"]
-        RM[("rooms Map<br/>roomId → broadcaster, viewers Set")]
+        EX["Express<br/>serves the room page"]
+        WSS["WebSocket<br/>relays SDP + ICE"]
+        RM[("rooms Map")]
         WSS <--> RM
     end
 
-    subgraph roomB["Room lucky-moose-30 — independent"]
-        BB["Broadcaster B"]
-        VB1["Viewer B1"]
+    subgraph roomA["Room swift-otter-24"]
+        BA["Broadcaster A<br/>screen capture"]
+        VA1["Viewer A1"]
+        VA2["Viewer A2"]
+        BA ==>|"video"| VA1
+        BA ==>|"video"| VA2
     end
 
-    BA -. "HTTP page load" .-> EX
-    VA1 -. "HTTP page load" .-> EX
-    VA2 -. "HTTP page load" .-> EX
+    subgraph roomB["Room lucky-moose-30"]
+        BB["Broadcaster B"]
+        VB1["Viewer B1"]
+        BB ==>|"video"| VB1
+    end
 
-    BA -. "WS signaling — SDP + ICE only" .-> WSS
-    VA1 -. "WS signaling" .-> WSS
-    VA2 -. "WS signaling" .-> WSS
-    BB -. "WS signaling" .-> WSS
-    VB1 -. "WS signaling" .-> WSS
-
-    BA ==>|"WebRTC media — bypasses server"| VA1
-    BA ==>|"WebRTC media — second full encode"| VA2
-    BB ==>|"WebRTC media"| VB1
+    srv -. "page load + signaling" .-> roomA
+    srv -. "page load + signaling" .-> roomB
 
     classDef server fill:#1e3a5f,stroke:#4a90d9,color:#e8f0f8
     classDef bcast fill:#5f1e1e,stroke:#d94a4a,color:#f8e8e8
@@ -67,7 +59,7 @@ flowchart LR
     class VA1,VA2,VB1 viewer
 ```
 
-Dashed edges are the only traffic the server sees. Thick edges are the video, routed peer-to-peer.
+Dashed edges are the only traffic the server sees; thick edges are the video, which stays inside the room and never reaches the server. Rooms are fully independent — a second broadcaster means a second room, not a second load on the process.
 
 ## Does a second broadcaster cost the server anything?
 
