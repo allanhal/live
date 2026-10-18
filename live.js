@@ -10,11 +10,14 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// rooms: Map<roomId, { broadcaster: ws | null, viewers: Set<ws> }>
+// rooms: Map<roomId, { broadcaster: ws | null, viewers: Map<viewerId, ws> }>
+// Viewers are keyed by id because every broadcaster-originated message has to
+// find one: as a Set that meant rebuilding an array of all viewers per message,
+// which is O(N^2) allocations across an ICE flood.
 const rooms = new Map();
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { broadcaster: null, viewers: new Set() });
+  if (!rooms.has(id)) rooms.set(id, { broadcaster: null, viewers: new Map() });
   return rooms.get(id);
 }
 
@@ -90,10 +93,16 @@ wss.on("connection", (ws, req) => {
           role = "broadcaster";
           room.broadcaster = ws;
           send(ws, { type: "role", role: "broadcaster" });
-          console.log(`[${roomId}] broadcaster connected`);
+          // Viewers already waiting in this room would otherwise never be
+          // offered a stream: "viewer-joined" only fired at their join, which
+          // happened before there was a broadcaster to hear it.
+          for (const viewerId of room.viewers.keys()) {
+            send(ws, { type: "viewer-joined", viewerId });
+          }
+          console.log(`[${roomId}] broadcaster connected (${room.viewers.size} viewers waiting)`);
         } else {
           role = "viewer";
-          room.viewers.add(ws);
+          room.viewers.set(idFor(ws), ws);
           send(ws, { type: "role", role: "viewer" });
           send(room.broadcaster, { type: "viewer-joined", viewerId: idFor(ws) });
           console.log(`[${roomId}] viewer connected (${room.viewers.size} total)`);
@@ -106,7 +115,7 @@ wss.on("connection", (ws, req) => {
       case "ice-candidate": {
         if (!room) break;
         if (role === "broadcaster" && msg.viewerId) {
-          const target = [...room.viewers].find((v) => idFor(v) === msg.viewerId);
+          const target = room.viewers.get(msg.viewerId);
           if (target) send(target, { type: msg.type, data: msg.data });
         } else if (role === "viewer" && room.broadcaster) {
           send(room.broadcaster, { type: msg.type, data: msg.data, viewerId: idFor(ws) });
@@ -120,13 +129,13 @@ wss.on("connection", (ws, req) => {
     if (!room) return;
     if (role === "broadcaster") {
       room.broadcaster = null;
-      for (const v of room.viewers) send(v, { type: "broadcaster-left" });
+      for (const v of room.viewers.values()) send(v, { type: "broadcaster-left" });
       // Keep the viewers: they are still connected and waiting, and clearing
       // them here deleted the room out from under them, so a returning
       // broadcaster got a fresh room object the old viewers were not in.
       console.log(`[${roomId}] broadcaster disconnected (${room.viewers.size} viewers waiting)`);
     } else if (role === "viewer") {
-      room.viewers.delete(ws);
+      room.viewers.delete(idFor(ws));
       if (room.broadcaster) {
         send(room.broadcaster, { type: "viewer-left", viewerId: idFor(ws) });
       }
@@ -218,16 +227,17 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
   #status {
     position: fixed; top: 0; left: 0; right: 0;
     padding: 10px 16px; text-align: center;
-    background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
+    background: #121212;
     font-size: 14px; z-index: 10;
   }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
   .dot-red { background: #e53e3e; }
-  .dot-green { background: #38a169; animation: pulse 2s infinite; }
+  .dot-green { background: #38a169; animation: pulse 2s infinite; will-change: opacity; }
   .dot-yellow { background: #d69e2e; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
   #video-container {
     position: relative; width: 100%; max-width: 1280px;
+    contain: paint;
     background: #111; border-radius: 8px; overflow: hidden;
     aspect-ratio: 16/9;
   }
@@ -284,6 +294,7 @@ let role = null;
 let ws = null;
 let localStream = null;
 const peerConnections = new Map(); // viewerId -> RTCPeerConnection
+const waitingViewers = new Set();  // viewerIds announced before we had a stream
 
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -324,17 +335,23 @@ function connect() {
 
       // --- Broadcaster events ---
       case "viewer-joined":
-        if (role === "broadcaster" && localStream) {
-          await createPeerForViewer(msg.viewerId);
+        if (role === "broadcaster") {
+          // Before Share Screen there is nothing to offer, so remember them and
+          // connect once the stream exists. Without this a viewer who opened
+          // the URL first waited forever.
+          if (localStream) await createPeerForViewer(msg.viewerId);
+          else waitingViewers.add(msg.viewerId);
         }
         updateViewerCount();
         break;
 
       case "viewer-left":
+        waitingViewers.delete(msg.viewerId);
         if (peerConnections.has(msg.viewerId)) {
           peerConnections.get(msg.viewerId).close();
           peerConnections.delete(msg.viewerId);
         }
+        if (peerConnections.size === 0) stopQualityMonitor();
         updateViewerCount();
         break;
 
@@ -387,13 +404,21 @@ startBtn.addEventListener("click", async () => {
     startBtn.style.display = "none";
     setStatus("green", "Broadcasting");
 
+    // Connect anyone who was already in the room before we started sharing.
+    for (const viewerId of waitingViewers) await createPeerForViewer(viewerId);
+    waitingViewers.clear();
+    updateViewerCount();
+
     localStream.getVideoTracks()[0].onended = () => {
       setStatus("red", "Screen share stopped");
-      for (const [id, pc] of peerConnections) pc.close();
+      for (const [, pc] of peerConnections) pc.close();
       peerConnections.clear();
+      stopQualityMonitor();
+      currentTierIndex = 0;
       localStream = null;
       video.srcObject = null;
       startBtn.style.display = "block";
+      updateViewerCount();
     };
   } catch (err) {
     setStatus("red", "Screen share cancelled or failed");
@@ -408,6 +433,11 @@ async function createPeerForViewer(viewerId) {
     pc.addTrack(track, localStream);
   }
 
+  // Aim the encoder at the current tier before negotiating. Without this the
+  // sender runs at the browser default and the monitor is comparing throughput
+  // against a target nobody set.
+  await applyQualityTier(pc, currentTierIndex);
+
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       ws.send(JSON.stringify({ type: "ice-candidate", viewerId, data: e.candidate }));
@@ -418,7 +448,7 @@ async function createPeerForViewer(viewerId) {
   await pc.setLocalDescription(offer);
   ws.send(JSON.stringify({ type: "offer", viewerId, data: pc.localDescription }));
 
-  monitorConnection(viewerId, pc);
+  startQualityMonitor();
 }
 
 // --- Adaptive bitrate ---
@@ -443,60 +473,87 @@ async function applyQualityTier(pc, tierIndex) {
   await sender.setParameters(params);
 }
 
-function monitorConnection(viewerId, pc) {
-  let prevBytesSent = 0;
-  let prevTimestamp = 0;
-  let lowCount = 0;
-  let highCount = 0;
+// One monitor for the whole broadcast, not one per viewer. The tier is a
+// single shared decision (every viewer is fed from one uplink and one CPU), so
+// a timer per viewer meant N of them racing to mutate currentTierIndex and
+// falling through the tiers N times too fast.
+//
+// The old test compared measured throughput against the tier's maxBitrate.
+// That could only ever ratchet down: nothing applied the tier to the sender at
+// peer creation, so the encoder targeted the browser default of roughly 2 Mbps
+// and "below 40% of 8 Mbps" was true from the first sample on an idle network.
+// Three samples later it had dropped a tier, and recovery needed throughput
+// above 85% of a target that was never set, which a static screen never
+// reaches. Every session ended at 500 kbps and stayed there.
+//
+// qualityLimitationReason is the signal that actually answers the question:
+// the encoder reports whether it is being held back, and by what.
+const MONITOR_MS = 2000;
+const DOWNGRADE_AFTER = 3;   // ~6s limited before dropping a tier
+const UPGRADE_AFTER = 8;     // ~16s clear before climbing back
 
-  const interval = setInterval(async () => {
-    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
-      clearInterval(interval);
-      return;
-    }
+let qualityMonitor = null;
+let limitedRounds = 0;
+let clearRounds = 0;
 
-    const stats = await pc.getStats();
-    for (const report of stats.values()) {
-      if (report.type === "outbound-rtp" && report.kind === "video") {
-        if (prevTimestamp > 0) {
-          const elapsed = (report.timestamp - prevTimestamp) / 1000;
-          const bitrate = ((report.bytesSent - prevBytesSent) * 8) / elapsed;
-          const tier = QUALITY_TIERS[currentTierIndex];
+function startQualityMonitor() {
+  if (qualityMonitor) return;
+  limitedRounds = 0;
+  clearRounds = 0;
 
-          // If actual bitrate is far below target, connection is constrained
-          if (bitrate < tier.maxBitrate * 0.4 && currentTierIndex < QUALITY_TIERS.length - 1) {
-            lowCount++;
-            highCount = 0;
-            if (lowCount >= 3) {
-              currentTierIndex++;
-              console.log("[bandwidth] downgrading to " + QUALITY_TIERS[currentTierIndex].label);
-              for (const [, p] of peerConnections) applyQualityTier(p, currentTierIndex);
-              setStatus("green", "Broadcasting (" + QUALITY_TIERS[currentTierIndex].label + " quality)");
-              lowCount = 0;
-            }
-          }
-          // If connection recovered, try upgrading
-          else if (bitrate > tier.maxBitrate * 0.85 && currentTierIndex > 0) {
-            highCount++;
-            lowCount = 0;
-            if (highCount >= 5) {
-              currentTierIndex--;
-              console.log("[bandwidth] upgrading to " + QUALITY_TIERS[currentTierIndex].label);
-              for (const [, p] of peerConnections) applyQualityTier(p, currentTierIndex);
-              setStatus("green", "Broadcasting (" + QUALITY_TIERS[currentTierIndex].label + " quality)");
-              highCount = 0;
-            }
-          } else {
-            lowCount = Math.max(0, lowCount - 1);
-            highCount = Math.max(0, highCount - 1);
-          }
+  qualityMonitor = setInterval(async () => {
+    if (peerConnections.size === 0) return;
+
+    let sawVideo = false;
+    let limitedBy = null;
+
+    for (const pc of peerConnections.values()) {
+      if (pc.connectionState !== "connected") continue;
+      const stats = await pc.getStats();
+      for (const report of stats.values()) {
+        if (report.type === "outbound-rtp" && report.kind === "video") {
+          sawVideo = true;
+          const reason = report.qualityLimitationReason;
+          if (reason && reason !== "none") limitedBy = reason;
         }
-        prevBytesSent = report.bytesSent;
-        prevTimestamp = report.timestamp;
-        break;
       }
     }
-  }, 2000);
+
+    if (!sawVideo) return;
+
+    if (limitedBy) {
+      limitedRounds++;
+      clearRounds = 0;
+    } else {
+      clearRounds++;
+      limitedRounds = 0;
+    }
+
+    if (limitedRounds >= DOWNGRADE_AFTER && currentTierIndex < QUALITY_TIERS.length - 1) {
+      currentTierIndex++;
+      limitedRounds = 0;
+      console.log("[quality] limited by " + limitedBy + ", dropping to " + QUALITY_TIERS[currentTierIndex].label);
+      await retuneAllPeers();
+    } else if (clearRounds >= UPGRADE_AFTER && currentTierIndex > 0) {
+      currentTierIndex--;
+      clearRounds = 0;
+      console.log("[quality] unconstrained, raising to " + QUALITY_TIERS[currentTierIndex].label);
+      await retuneAllPeers();
+    }
+  }, MONITOR_MS);
+}
+
+function stopQualityMonitor() {
+  clearInterval(qualityMonitor);
+  qualityMonitor = null;
+}
+
+async function retuneAllPeers() {
+  for (const pc of peerConnections.values()) await applyQualityTier(pc, currentTierIndex);
+  const tier = QUALITY_TIERS[currentTierIndex];
+  setStatus("green", currentTierIndex === 0
+    ? "Broadcasting"
+    : "Broadcasting (" + tier.label + " quality)");
 }
 
 // --- Viewer logic ---
@@ -536,8 +593,16 @@ unmuteBtn.addEventListener("click", () => {
 
 // --- UI helpers ---
 
+const statusDot = document.createElement("span");
+const statusText = document.createTextNode("");
+statusEl.textContent = "";
+statusEl.append(statusDot, " ", statusText);
+
 function setStatus(color, text) {
-  statusEl.innerHTML = '<span class="dot dot-' + color + '"></span> ' + text;
+  // Assign rather than rebuild with innerHTML: recreating the dot restarted its
+  // animation and re-parsed the bar on every status change.
+  statusDot.className = "dot dot-" + color;
+  statusText.nodeValue = text;
 }
 
 function updateViewerCount() {

@@ -90,12 +90,15 @@ A broadcaster leaving does **not** evict the viewers — they stay connected and
 
 ## Known limitations
 
-- **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. Past a handful of viewers this needs simulcast or an SFU.
-- **STUN only, no TURN.** On symmetric NAT or a corporate network the peer connection simply fails, with no relay to fall back on. Adding TURN fixes it but puts video bandwidth on a server.
-- **Viewers who arrive early get nothing.** `viewer-joined` requires `localStream` to already exist, and the Share Screen handler does not loop back over viewers who joined before it, so they wait forever.
-- **The adaptive bitrate controller only ratchets down.** It compares measured throughput against a target nobody set on the sender, so the test is true from the start and quality falls to the lowest tier within ~20 seconds regardless of the network — then cannot climb back, because recovery requires saturating a bitrate the encoder was never aimed at.
+- **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. This is the real ceiling on audience size, and lifting it means simulcast or an SFU rather than a change to this file.
+- **STUN only, no TURN.** On symmetric NAT or a corporate network the peer connection simply fails, with no relay to fall back on. Fixing it means running coturn and opening UDP ports, which also puts video bandwidth back on a server.
 - **Deployment is manual.** Nothing in the repo provisions `live.allanpinheiro.com`; the process has to be run and fronted by TLS somewhere. WebRTC screen capture requires a secure context, so plain HTTP only works on `localhost`.
-- **O(N) viewer lookup.** Broadcaster-originated messages rebuild an array of every viewer to find one by id, which is O(N²) allocations across an ICE flood.
+
+## Quality control
+
+The sender is aimed at the current tier before each offer is negotiated, and one monitor — not one per viewer — polls `qualityLimitationReason` every 2s across all peers. Three limited rounds drop a tier, eight clear rounds climb back.
+
+The previous version compared measured throughput against the tier's `maxBitrate`. That could only ratchet down: nothing applied the tier to the sender at peer creation, so the encoder targeted the browser default of ~2 Mbps while the test asked whether throughput had reached 40% of 8 Mbps. It was true from the first sample on an idle network, so every session fell to 500 kbps within ~20 seconds and could never recover, because climbing back required saturating a bitrate the encoder had never been pointed at. A timer per viewer made it worse by racing N writers on one shared tier index.
 
 ## License
 
