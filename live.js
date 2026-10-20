@@ -251,13 +251,40 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
     cursor: pointer; transition: background 0.2s; z-index: 2;
   }
   #start-btn:hover { background: #c53030; }
-  #unmute-btn {
+  #volume {
     position: absolute; bottom: 16px; right: 16px;
-    padding: 8px 16px; font-size: 14px; font-weight: 600;
-    background: #e53e3e; color: white; border: none; border-radius: 6px;
-    cursor: pointer; z-index: 3; display: none;
+    display: none; align-items: center; gap: 10px;
+    padding: 8px 14px; z-index: 3;
+    background: rgba(18, 18, 18, 0.82); border-radius: 6px;
+    /* The control sits over the video, so it has to stay readable on a white
+       frame as well as a dark one. */
+    backdrop-filter: blur(4px);
   }
-  #unmute-btn:hover { background: #c53030; }
+  #mute-btn {
+    padding: 0; font-size: 18px; line-height: 1;
+    background: none; color: #e0e0e0; border: none;
+    cursor: pointer;
+  }
+  /* The slider is the hint to unmute while the stream is muted, so it is worth
+     more than the 2px the UA default gives it. */
+  #volume-slider {
+    -webkit-appearance: none; appearance: none;
+    width: 90px; height: 4px; border-radius: 2px;
+    background: #444; cursor: pointer;
+  }
+  #volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: #e0e0e0; border: none; cursor: pointer;
+  }
+  #volume-slider::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: #e0e0e0; border: none; cursor: pointer;
+  }
+  #volume-slider:focus-visible { outline: 2px solid #4a90d9; outline-offset: 4px; }
+  #volume.muted #volume-slider { background: #333; }
+  #volume.muted #volume-slider::-webkit-slider-thumb { background: #777; }
+  #volume.muted #volume-slider::-moz-range-thumb { background: #777; }
   #waiting {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     color: #888; font-size: 16px;
@@ -275,7 +302,11 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
   <button id="start-btn" style="display:none">Share Screen</button>
   <video id="video" autoplay playsinline></video>
   <div id="waiting" style="display:none">Waiting for stream...</div>
-  <button id="unmute-btn">🔇 Click to unmute</button>
+  <div id="volume" class="muted">
+    <button id="mute-btn" title="Unmute" aria-label="Unmute">🔇</button>
+    <input id="volume-slider" type="range" min="0" max="100" value="100"
+           aria-label="Volume" title="Volume">
+  </div>
 </div>
 
 <div id="info"></div>
@@ -288,7 +319,9 @@ const statusEl = document.getElementById("status");
 const waitingEl = document.getElementById("waiting");
 const infoEl = document.getElementById("info");
 const viewersEl = document.getElementById("viewers-count");
-const unmuteBtn = document.getElementById("unmute-btn");
+const volumeEl = document.getElementById("volume");
+const muteBtn = document.getElementById("mute-btn");
+const volumeSlider = document.getElementById("volume-slider");
 
 let role = null;
 let ws = null;
@@ -565,11 +598,13 @@ async function handleOffer(offer) {
 
   viewerPC.ontrack = (e) => {
     video.srcObject = e.streams[0] || new MediaStream([e.track]);
-    video.muted = true;
+    // A new stream has to start muted to autoplay, so put the control back in
+    // its muted state rather than leaving it showing sound that is not playing.
+    applyVolume(lastVolume, true);
     waitingEl.style.display = "none";
     setStatus("green", "Watching stream");
     video.play().then(() => {
-      if (role === "viewer") unmuteBtn.style.display = "block";
+      if (role === "viewer") volumeEl.style.display = "flex";
     }).catch(() => {});
   };
 
@@ -585,11 +620,48 @@ async function handleOffer(offer) {
   ws.send(JSON.stringify({ type: "answer", data: viewerPC.localDescription }));
 }
 
-unmuteBtn.addEventListener("click", () => {
-  video.muted = false;
-  unmuteBtn.textContent = "🔊 Sound on";
-  setTimeout(() => { unmuteBtn.style.display = "none"; }, 1500);
+// --- Volume ---
+
+// Autoplay only survives if the video starts muted, so the control opens muted
+// and the first interaction with either half of it is the unmute.
+const VOLUME_KEY = "live:volume";
+
+let lastVolume = 1;
+try {
+  const stored = parseFloat(localStorage.getItem(VOLUME_KEY));
+  if (stored > 0 && stored <= 1) lastVolume = stored;
+} catch {}
+
+volumeSlider.value = String(Math.round(lastVolume * 100));
+
+function applyVolume(level, muted) {
+  video.muted = muted || level === 0;
+  video.volume = level;
+  volumeSlider.value = String(Math.round(level * 100));
+  volumeEl.classList.toggle("muted", video.muted);
+  muteBtn.textContent = video.muted ? "🔇" : level > 0.5 ? "🔊" : "🔈";
+  const action = video.muted ? "Unmute" : "Mute";
+  muteBtn.title = action;
+  muteBtn.setAttribute("aria-label", action);
+  // Only a level worth returning to is remembered: storing 0 would make the
+  // next visit mute itself with no way to tell that from a fresh one.
+  if (level > 0) {
+    lastVolume = level;
+    try { localStorage.setItem(VOLUME_KEY, String(level)); } catch {}
+  }
+}
+
+muteBtn.addEventListener("click", () => {
+  if (video.muted) applyVolume(lastVolume, false);
+  else applyVolume(video.volume, true);
 });
+
+volumeSlider.addEventListener("input", () => {
+  // Dragging off zero is an unmute: nobody moves the slider to stay silent.
+  applyVolume(volumeSlider.value / 100, false);
+});
+
+applyVolume(lastVolume, true);
 
 // --- UI helpers ---
 

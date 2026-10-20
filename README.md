@@ -88,6 +88,10 @@ A broadcaster leaving does **not** evict the viewers — they stay connected and
 
 `GET /healthz` reports `{ ok, rooms, clients, uptime }`.
 
+## Viewer audio
+
+A viewer's stream starts muted, because an unmuted `play()` is blocked by autoplay policy and the result is a black frame rather than a prompt. The viewer gets a mute toggle and a volume slider over the bottom-right of the video; the first move of either one is the unmute, and the level is kept in `localStorage` so the next room opens at the same volume. A level of 0 is not stored — otherwise a visit that ended silent would start the next one silent with nothing to explain it.
+
 ## Known limitations
 
 - **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. This is the real ceiling on audience size, and lifting it means simulcast or an SFU rather than a change to this file.
