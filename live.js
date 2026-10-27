@@ -23,9 +23,52 @@ const rooms = new Map();
 
 function getRoom(id) {
   if (!rooms.has(id)) {
-    rooms.set(id, { broadcaster: null, viewers: new Map(), createdAt: Date.now() });
+    rooms.set(id, {
+      broadcaster: null,
+      viewers: new Map(),
+      createdAt: Date.now(),
+      uplink: null,              // newest sample from the broadcaster
+      downlinks: new Map(),      // clientId -> newest sample from that viewer
+      quality: null,             // admin override, null means the client decides
+    });
   }
   return rooms.get(id);
+}
+
+// Clients are not trusted to send well-formed numbers, and these values go
+// into the admin page: take the fields we display, coerce them, drop the rest.
+function num(v, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(Math.min(n, max) * 10) / 10;
+}
+
+function pickUplink(d) {
+  return {
+    kbps: num(d.kbps, 1e6),
+    fps: num(d.fps, 240),
+    width: num(d.width, 16384),
+    height: num(d.height, 16384),
+    tier: typeof d.tier === "string" ? d.tier.slice(0, 16) : null,
+    pinned: Boolean(d.pinned),
+    limitation: typeof d.limitation === "string" ? d.limitation.slice(0, 16) : null,
+    encodeMs: num(d.encodeMs, 10000),
+    peers: num(d.peers, 1000),
+  };
+}
+
+function pickDownlink(d) {
+  return {
+    kbps: num(d.kbps, 1e6),
+    fps: num(d.fps, 240),
+    width: num(d.width, 16384),
+    height: num(d.height, 16384),
+    rttMs: num(d.rttMs, 60000),
+    jitterMs: num(d.jitterMs, 60000),
+    delayMs: num(d.delayMs, 60000),
+    lossPct: num(d.lossPct, 100),
+    freezeCount: num(d.freezeCount, 1e6),
+  };
 }
 
 function cleanRoom(id) {
@@ -148,6 +191,20 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
+      // Measurements, not signaling: the server keeps only the newest sample
+      // per room so /admin can show what the stream is actually doing. Nothing
+      // is relayed to other clients and nothing is kept in history -- this is a
+      // gauge, not a time series.
+      case "stats": {
+        if (!room || !msg.data || typeof msg.data !== "object") break;
+        if (role === "broadcaster") {
+          room.uplink = { at: Date.now(), ...pickUplink(msg.data) };
+        } else if (role === "viewer") {
+          room.downlinks.set(clientId, { at: Date.now(), ...pickDownlink(msg.data) });
+        }
+        break;
+      }
+
       case "offer":
       case "answer":
       case "ice-candidate": {
@@ -168,6 +225,7 @@ wss.on("connection", (ws, req) => {
     if (role === "broadcaster") {
       if (room.broadcaster !== ws) return; // replaced by a reconnect; not ours to clear
       room.broadcaster = null;
+      room.uplink = null;
       for (const v of room.viewers.values()) send(v, { type: "broadcaster-left" });
       // Keep the viewers: they are still connected and waiting, and clearing
       // them here deleted the room out from under them, so a returning
@@ -179,6 +237,7 @@ wss.on("connection", (ws, req) => {
       // delete the new one or tell the broadcaster that a live viewer left.
       if (room.viewers.get(clientId) === ws) {
         room.viewers.delete(clientId);
+        room.downlinks.delete(clientId);
         if (room.broadcaster) {
           send(room.broadcaster, { type: "viewer-left", viewerId: clientId });
         }
@@ -355,6 +414,14 @@ function adminReset() {
   return counts;
 }
 
+// A sample older than a few rounds means the reporter stopped rather than that
+// the stream is idle, and a stale number in a dashboard is worse than none.
+const STATS_TTL_MS = 8000;
+function fresh(sample) {
+  if (!sample) return null;
+  return Date.now() - sample.at <= STATS_TTL_MS ? sample : null;
+}
+
 function roomState() {
   const out = [];
   for (const [id, room] of rooms) {
@@ -364,8 +431,11 @@ function roomState() {
       viewers: [...room.viewers.keys()].map((viewerId) => ({
         viewerId,
         joinedAt: room.viewers.get(viewerId).joinedAt || null,
+        stats: fresh(room.downlinks.get(viewerId)),
       })),
       createdAt: room.createdAt || null,
+      uplink: fresh(room.uplink),
+      quality: room.quality,
     });
   }
   out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -431,6 +501,30 @@ adminApi.get("/state", (_req, res) => {
       now: Date.now(),
     },
   });
+});
+
+// The tiers are the broadcaster's to apply -- it owns the senders -- so this
+// is a command, not a setting the server enforces. "auto" hands control back.
+const TIER_LABELS = ["high", "medium", "low", "potato"];
+
+adminApi.post("/rooms/:roomId/quality", (req, res) => {
+  const room = rooms.get(req.params.roomId);
+  if (!room) return res.status(404).json({ error: "no such room" });
+  if (!room.broadcaster) return res.status(409).json({ error: "no broadcaster to apply it" });
+
+  const body = req.body || {};
+  const tier = body.tier === "auto" ? "auto" : TIER_LABELS.indexOf(String(body.tier));
+  if (tier !== "auto" && tier < 0) return res.status(400).json({ error: "tier must be auto, " + TIER_LABELS.join(", ") });
+
+  const maxBitrate = body.maxBitrate === undefined || body.maxBitrate === null || body.maxBitrate === ""
+    ? null : Math.max(100_000, Math.min(50_000_000, parseInt(body.maxBitrate, 10) || 0));
+  const maxFramerate = body.maxFramerate === undefined || body.maxFramerate === null || body.maxFramerate === ""
+    ? null : Math.max(1, Math.min(120, parseInt(body.maxFramerate, 10) || 0));
+
+  room.quality = { tier, maxBitrate, maxFramerate, at: Date.now() };
+  send(room.broadcaster, { type: "quality", tier, maxBitrate, maxFramerate });
+  console.log(`[${req.params.roomId}] quality set by admin: ${JSON.stringify(room.quality)}`);
+  res.json({ ok: true, quality: room.quality });
 });
 
 adminApi.post("/rooms/:roomId/stop", (req, res) => {
@@ -712,6 +806,16 @@ function connect() {
         setStatus("red", "Broadcaster disconnected");
         break;
 
+      case "quality":
+        if (role === "broadcaster") {
+          pinnedTier = msg.tier === "auto" ? null : msg.tier;
+          bitrateOverride = msg.maxBitrate || null;
+          framerateOverride = msg.maxFramerate || null;
+          if (pinnedTier !== null) currentTierIndex = pinnedTier;
+          await retuneAllPeers();
+        }
+        break;
+
       // --- Admin events ---
       case "admin-moved":
         evicted = true;
@@ -857,6 +961,11 @@ const QUALITY_TIERS = [
 ];
 
 let currentTierIndex = 0;
+// Set by /admin. While a tier is pinned the monitor still measures and reports
+// but stops moving the tier, so an operator's choice is not undone 6s later.
+let pinnedTier = null;
+let bitrateOverride = null;
+let framerateOverride = null;
 
 async function applyQualityTier(pc, tierIndex) {
   const tier = QUALITY_TIERS[tierIndex];
@@ -864,9 +973,48 @@ async function applyQualityTier(pc, tierIndex) {
   if (!sender) return;
   const params = sender.getParameters();
   if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-  params.encodings[0].maxBitrate = tier.maxBitrate;
+  params.encodings[0].maxBitrate = bitrateOverride || tier.maxBitrate;
   params.encodings[0].scaleResolutionDownBy = tier.scaleDown;
+  // An explicit cap is the one knob that reliably cuts latency on a screen
+  // share: dropping 60fps to 30 halves what the encoder and the uplink have to
+  // keep up with, where a resolution change only shrinks each frame.
+  if (framerateOverride) params.encodings[0].maxFramerate = framerateOverride;
+  else delete params.encodings[0].maxFramerate;
   await sender.setParameters(params);
+}
+
+// Byte counters are cumulative, so a rate needs the previous sample.
+const lastSent = new Map(); // viewerId -> { bytes, at }
+
+async function collectUplinkStats() {
+  let kbps = 0, fps = null, width = null, height = null, limitation = null, encodeMs = null, peers = 0;
+  for (const [viewerId, pc] of peerConnections) {
+    if (pc.connectionState !== "connected") continue;
+    const stats = await pc.getStats();
+    for (const r of stats.values()) {
+      if (r.type !== "outbound-rtp" || r.kind !== "video") continue;
+      peers++;
+      const prev = lastSent.get(viewerId);
+      const now = r.timestamp;
+      if (prev && now > prev.at) {
+        kbps += ((r.bytesSent - prev.bytes) * 8) / (now - prev.at);
+      }
+      lastSent.set(viewerId, { bytes: r.bytesSent, at: now });
+      if (r.framesPerSecond != null) fps = Math.max(fps || 0, r.framesPerSecond);
+      if (r.frameWidth) { width = r.frameWidth; height = r.frameHeight; }
+      if (r.qualityLimitationReason && r.qualityLimitationReason !== "none") limitation = r.qualityLimitationReason;
+      // Encode time per frame is the tell for "the machine cannot keep up",
+      // which no amount of bitrate tuning fixes.
+      if (r.totalEncodeTime != null && r.framesEncoded) encodeMs = (r.totalEncodeTime / r.framesEncoded) * 1000;
+    }
+  }
+  for (const id of [...lastSent.keys()]) if (!peerConnections.has(id)) lastSent.delete(id);
+  return {
+    kbps: Math.round(kbps), fps, width, height, peers,
+    tier: QUALITY_TIERS[currentTierIndex].label,
+    pinned: pinnedTier !== null,
+    limitation, encodeMs,
+  };
 }
 
 // One monitor for the whole broadcast, not one per viewer. The tier is a
@@ -898,7 +1046,6 @@ function startQualityMonitor() {
   clearRounds = 0;
 
   qualityMonitor = setInterval(async () => {
-    if (peerConnections.size === 0) return;
 
     let sawVideo = false;
     let limitedBy = null;
@@ -915,7 +1062,13 @@ function startQualityMonitor() {
       }
     }
 
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "stats", data: await collectUplinkStats() }));
+    }
+
     if (!sawVideo) return;
+    // Pinned from /admin: keep measuring and reporting, stop steering.
+    if (pinnedTier !== null) return;
 
     if (limitedBy) {
       limitedRounds++;
@@ -947,9 +1100,10 @@ function stopQualityMonitor() {
 async function retuneAllPeers() {
   for (const pc of peerConnections.values()) await applyQualityTier(pc, currentTierIndex);
   const tier = QUALITY_TIERS[currentTierIndex];
-  setStatus("green", currentTierIndex === 0
+  const pinnedNote = pinnedTier !== null ? " — set by admin" : "";
+  setStatus("green", currentTierIndex === 0 && !pinnedNote
     ? "Broadcasting"
-    : "Broadcasting (" + tier.label + " quality)");
+    : "Broadcasting (" + tier.label + " quality" + pinnedNote + ")");
 }
 
 // --- Viewer logic ---
@@ -966,6 +1120,7 @@ async function handleOffer(offer) {
     applyVolume(lastVolume, true);
     waitingEl.style.display = "none";
     setStatus("green", "Watching stream");
+    startViewerStats();
     video.play().then(() => {
       if (role === "viewer") volumeEl.style.display = "flex";
     }).catch(() => {});
@@ -981,6 +1136,53 @@ async function handleOffer(offer) {
   const answer = await viewerPC.createAnswer();
   await viewerPC.setLocalDescription(answer);
   ws.send(JSON.stringify({ type: "answer", data: viewerPC.localDescription }));
+}
+
+// --- Viewer telemetry ---
+
+// What the viewer sees is the only measurement that answers "is it laggy":
+// jitter buffer delay is the wait before a frame is painted, and freezes are
+// the symptom people actually report.
+let viewerStatsTimer = null;
+let lastRecv = null;
+let lastJitter = null;
+
+function startViewerStats() {
+  if (viewerStatsTimer) return;
+  viewerStatsTimer = setInterval(async () => {
+    if (!viewerPC || viewerPC.connectionState !== "connected") return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const stats = await viewerPC.getStats();
+    const out = {};
+    for (const r of stats.values()) {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        if (lastRecv && r.timestamp > lastRecv.at) {
+          out.kbps = Math.round(((r.bytesReceived - lastRecv.bytes) * 8) / (r.timestamp - lastRecv.at));
+        }
+        lastRecv = { bytes: r.bytesReceived, at: r.timestamp };
+        if (r.framesPerSecond != null) out.fps = r.framesPerSecond;
+        if (r.frameWidth) { out.width = r.frameWidth; out.height = r.frameHeight; }
+        if (r.jitter != null) out.jitterMs = r.jitter * 1000;
+        if (r.freezeCount != null) out.freezeCount = r.freezeCount;
+        if (r.packetsLost != null && r.packetsReceived) {
+          out.lossPct = (r.packetsLost / (r.packetsLost + r.packetsReceived)) * 100;
+        }
+        // Cumulative totals: the delta between samples is the current delay,
+        // not the average since the stream began.
+        if (r.jitterBufferDelay != null && r.jitterBufferEmittedCount) {
+          if (lastJitter && r.jitterBufferEmittedCount > lastJitter.count) {
+            out.delayMs = ((r.jitterBufferDelay - lastJitter.delay) /
+                           (r.jitterBufferEmittedCount - lastJitter.count)) * 1000;
+          }
+          lastJitter = { delay: r.jitterBufferDelay, count: r.jitterBufferEmittedCount };
+        }
+      }
+      if (r.type === "candidate-pair" && r.state === "succeeded" && r.currentRoundTripTime != null) {
+        out.rttMs = r.currentRoundTripTime * 1000;
+      }
+    }
+    ws.send(JSON.stringify({ type: "stats", data: out }));
+  }, MONITOR_MS);
 }
 
 // --- Volume ---
@@ -1101,6 +1303,24 @@ const ADMIN_HTML = /* html */ `<!DOCTYPE html>
     background: #0e0e0e; color: #e0e0e0; min-width: 0;
   }
   input:focus-visible, button:focus-visible { outline: 2px solid #4a90d9; outline-offset: 2px; }
+  .metrics {
+    margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px 14px;
+    font-size: 12px; color: #9ab;
+    font-variant-numeric: tabular-nums;
+  }
+  .metrics .k { color: #667; }
+  .metrics .bad { color: #ff8f8f; }
+  .metrics .warn { color: #d6a93e; }
+  .controls {
+    margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    font-size: 12px; color: #777;
+  }
+  .controls select, .controls input {
+    padding: 6px 8px; border-radius: 6px; border: 1px solid #333;
+    background: #0e0e0e; color: #e0e0e0; font-size: 12px;
+  }
+  .controls input { width: 78px; }
+  .pinned { color: #d6a93e; }
   .viewers { margin-top: 12px; border-top: 1px solid #1f1f1f; padding-top: 10px; display: grid; gap: 6px; }
   .viewer { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #999; }
   .viewer .grow { flex: 1; }
@@ -1247,6 +1467,79 @@ function roomCard(room, now) {
   head.append(stop, rename, close);
   card.append(head);
 
+  // --- live measurements ---
+  const rate = kbps => kbps == null ? null : kbps >= 1000 ? (kbps / 1000).toFixed(1) + " Mbps" : Math.round(kbps) + " kbps";
+  const ms = v => v == null ? null : Math.round(v) + " ms";
+
+  function metricsRow(pairs) {
+    const el = document.createElement("div");
+    el.className = "metrics";
+    for (const [label, value, level] of pairs) {
+      if (value == null) continue;
+      const span = document.createElement("span");
+      const k = document.createElement("span");
+      k.className = "k";
+      k.textContent = label + " ";
+      const v = document.createElement("span");
+      if (level) v.className = level;
+      v.textContent = value;
+      span.append(k, v);
+      el.append(span);
+    }
+    return el;
+  }
+
+  const up = room.uplink;
+  if (up) {
+    card.append(metricsRow([
+      ["up", rate(up.kbps)],
+      ["res", up.width ? up.width + "x" + up.height : null],
+      ["fps", up.fps != null ? Math.round(up.fps) : null, up.fps != null && up.fps < 15 ? "bad" : null],
+      ["encode", up.encodeMs != null ? Math.round(up.encodeMs) + " ms" : null,
+        up.encodeMs > 20 ? "bad" : up.encodeMs > 10 ? "warn" : null],
+      ["tier", up.tier + (up.pinned ? " (pinned)" : " (auto)"), up.pinned ? "pinned" : null],
+      ["limited by", up.limitation, "warn"],
+      ["encodes", up.peers != null ? up.peers + "x" : null, up.peers > 2 ? "warn" : null],
+    ]));
+  } else if (room.live) {
+    card.append(metricsRow([["up", "no samples yet — broadcaster has not started sharing", "k"]]));
+  }
+
+  // --- quality controls ---
+  const controls = document.createElement("div");
+  controls.className = "controls";
+  const tierSel = document.createElement("select");
+  for (const [value, label] of [["auto", "auto"], ["high", "high — 8 Mbps"], ["medium", "medium — 3 Mbps"],
+                                ["low", "low — 1 Mbps"], ["potato", "potato — 500 kbps"]]) {
+    const opt = document.createElement("option");
+    opt.value = value; opt.textContent = label;
+    tierSel.append(opt);
+  }
+  const q = room.quality;
+  tierSel.value = q ? (q.tier === "auto" ? "auto" : ["high","medium","low","potato"][q.tier] || "auto") : "auto";
+  const bitrateIn = document.createElement("input");
+  bitrateIn.type = "text"; bitrateIn.placeholder = "kbps";
+  if (q && q.maxBitrate) bitrateIn.value = String(Math.round(q.maxBitrate / 1000));
+  const fpsIn = document.createElement("input");
+  fpsIn.type = "text"; fpsIn.placeholder = "fps";
+  if (q && q.maxFramerate) fpsIn.value = String(q.maxFramerate);
+  const apply = document.createElement("button");
+  apply.textContent = "Apply";
+  apply.disabled = !room.live;
+  apply.onclick = () => act("Quality applied to " + room.id,
+    "/rooms/" + encodeURIComponent(room.id) + "/quality",
+    { method: "POST", body: {
+        tier: tierSel.value,
+        maxBitrate: bitrateIn.value ? Math.round(parseFloat(bitrateIn.value) * 1000) : null,
+        maxFramerate: fpsIn.value ? parseInt(fpsIn.value, 10) : null,
+      } });
+  const lbl = document.createElement("span");
+  lbl.textContent = "quality";
+  const capLbl = document.createElement("span");
+  capLbl.textContent = "caps";
+  controls.append(lbl, tierSel, capLbl, bitrateIn, fpsIn, apply);
+  card.append(controls);
+
   if (room.viewers.length) {
     const list = document.createElement("div");
     list.className = "viewers";
@@ -1256,6 +1549,23 @@ function roomCard(room, now) {
       const label = document.createElement("span");
       label.className = "grow";
       label.textContent = "viewer " + viewer.viewerId + " · " + ago(viewer.joinedAt, now);
+      if (viewer.stats) {
+        const st = viewer.stats;
+        const row = metricsRow([
+          ["down", rate(st.kbps)],
+          ["fps", st.fps != null ? Math.round(st.fps) : null, st.fps != null && st.fps < 15 ? "bad" : null],
+          ["res", st.width ? st.width + "x" + st.height : null],
+          ["delay", ms(st.delayMs), st.delayMs > 400 ? "bad" : st.delayMs > 150 ? "warn" : null],
+          ["rtt", ms(st.rttMs), st.rttMs > 200 ? "warn" : null],
+          ["loss", st.lossPct != null ? st.lossPct.toFixed(1) + "%" : null,
+            st.lossPct > 3 ? "bad" : st.lossPct > 0.5 ? "warn" : null],
+          ["freezes", st.freezeCount || null, st.freezeCount > 0 ? "warn" : null],
+        ]);
+        row.style.flexBasis = "100%";
+        row.style.marginTop = "2px";
+        line.style.flexWrap = "wrap";
+        label.append(row);
+      }
       const kick = document.createElement("button");
       kick.textContent = "Kick";
       kick.onclick = () => act("Kicked viewer " + viewer.viewerId,
@@ -1311,10 +1621,10 @@ function startPolling() {
   loginEl.style.display = "none";
   panelEl.style.display = "block";
   refresh();
-  // Rooms come and go with their sockets, so the list is only true as of its
-  // last fetch; poll rather than let it drift.
+  // Rooms come and go with their sockets, and the measurements are resampled
+  // every 2s at each client, so the panel polls at the same cadence.
   clearInterval(timer);
-  timer = setInterval(refresh, 3000);
+  timer = setInterval(refresh, 2000);
 }
 
 function signOut(message) {
