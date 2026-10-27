@@ -18,6 +18,9 @@ fi
 : "${DEPLOY_PATH:?set DEPLOY_PATH in .deploy.env}"
 : "${DEPLOY_SERVICE:?set DEPLOY_SERVICE in .deploy.env}"
 DEPLOY_URL="${DEPLOY_URL:-}"
+# Expanded here, not on the server: the remote shell has no .deploy.env, so an
+# escaped default silently checked the wrong port.
+DEPLOY_PORT="${DEPLOY_PORT:-3000}"
 ssh_args=(-o BatchMode=yes -o ConnectTimeout=10)
 [ -n "${DEPLOY_KEY:-}" ] && ssh_args+=(-i "$DEPLOY_KEY")
 
@@ -52,7 +55,7 @@ systemctl is-active --quiet "$DEPLOY_SERVICE" || {
   exit 1
 }
 echo -n "==> deployed \$(git rev-parse --short HEAD): "
-curl -sf localhost:\${DEPLOY_PORT:-3000}/healthz || { echo "healthz failed" >&2; exit 1; }
+curl -sf localhost:$DEPLOY_PORT/healthz || { echo "healthz on port $DEPLOY_PORT failed" >&2; exit 1; }
 echo
 REMOTE
 
