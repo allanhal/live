@@ -257,29 +257,45 @@ function idFor(ws) {
 
 // --- Room IDs ---
 
-// Short, speakable slugs like "swift-otter-24" so a room can be read out loud
-// or typed from memory instead of copied character by character.
-const ADJECTIVES = [
-  "amber", "brave", "bright", "calm", "clever", "crisp", "daring", "eager",
-  "fair", "fancy", "gentle", "glad", "golden", "happy", "jolly", "keen",
-  "kind", "lively", "lucky", "merry", "mighty", "neat", "noble", "plucky",
-  "proud", "quick", "quiet", "rapid", "royal", "sharp", "shiny", "silver",
-  "smart", "snappy", "solid", "spry", "sunny", "swift", "tidy", "tough",
-  "vivid", "warm", "wise", "witty", "zesty",
+// Short, speakable slugs like "onca-veloz-azul" so a room can be read out loud
+// or typed from memory instead of copied character by character. Portuguese,
+// since that is the audience, and written without accents or cedillas: the id
+// has to survive ROOM_ID_RE, a URL bar and being spelled over a phone.
+//
+// Substantivo + adjetivo + cor, which is the order the words come in when
+// spoken, so the slug reads as a phrase rather than three tags.
+const SUBSTANTIVOS = [
+  "onca", "tatu", "arara", "tucano", "jacare", "lobo", "raposa", "coruja",
+  "falcao", "gaviao", "capivara", "lontra", "golfinho", "baleia", "tartaruga",
+  "camaleao", "iguana", "tubarao", "polvo", "caranguejo", "formiga", "abelha",
+  "besouro", "borboleta", "cigarra", "grilo", "sapo", "perereca", "cobra",
+  "cavalo", "cabra", "ovelha", "galo", "pato", "ganso", "pombo", "andorinha",
+  "colibri", "sabia", "canario", "papagaio", "periquito", "pinguim", "foca",
+  "urso", "veado", "gato", "coelho", "esquilo", "morcego", "macaco", "mico",
+  "preguica", "jaguatirica", "quati", "cutia", "paca", "anta", "bugio", "saci",
 ];
 
-const NOUNS = [
-  "otter", "falcon", "tiger", "panda", "koala", "heron", "lynx", "raven",
-  "bison", "cobra", "dingo", "eagle", "ferret", "gecko", "hawk", "ibis",
-  "jaguar", "kiwi", "lemur", "moose", "newt", "orca", "puffin", "quail",
-  "rabbit", "salmon", "shark", "sloth", "stork", "swan", "tapir", "toucan",
-  "turtle", "viper", "walrus", "weasel", "wombat", "yak", "zebra", "badger",
-  "beaver", "camel", "crane", "donkey", "marmot",
+const ADJETIVOS = [
+  "veloz", "rapido", "bravo", "calmo", "forte", "leve", "agil", "esperto",
+  "sabio", "alegre", "feliz", "gentil", "nobre", "audaz", "destemido", "fiel",
+  "firme", "fino", "garboso", "honesto", "jovem", "justo", "limpo", "lindo",
+  "macio", "magro", "manso", "novo", "quieto", "radiante", "raro", "risonho",
+  "robusto", "sereno", "simples", "sincero", "solto", "sonoro", "suave",
+  "teimoso", "tranquilo", "vivo", "zeloso", "claro", "doce", "grato",
+  "humilde", "valente", "ligeiro", "astuto",
+];
+
+const CORES = [
+  "azul", "verde", "amarelo", "vermelho", "laranja", "roxo", "rosa", "branco",
+  "preto", "cinza", "dourado", "prateado", "bronze", "marrom", "bege",
+  "violeta", "turquesa", "indigo", "carmim", "escarlate", "safira",
+  "esmeralda", "rubi", "ambar", "coral", "jade", "lilas", "magenta", "ocre",
+  "vinho",
 ];
 
 function newRoomId() {
   const pick = (arr) => arr[crypto.randomInt(arr.length)];
-  return pick(ADJECTIVES) + "-" + pick(NOUNS) + "-" + crypto.randomInt(10, 100);
+  return pick(SUBSTANTIVOS) + "-" + pick(ADJETIVOS) + "-" + pick(CORES);
 }
 
 // Any room id reaching :roomId is interpolated into the page, so keep it to a

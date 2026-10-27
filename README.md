@@ -19,9 +19,13 @@ Set `PUBLIC_ORIGIN` to change the public URL in the startup banner (defaults to 
 
 ## Room IDs
 
-Rooms are speakable slugs like `swift-otter-24` — 45 adjectives x 45 nouns x a two-digit number, about 182k combinations, generated with `crypto.randomInt`. They can be read over a phone instead of copied character by character.
+Rooms are speakable Portuguese slugs like `onca-veloz-azul` — substantivo + adjetivo + cor, in the order the words come in when spoken, so the slug reads as a phrase and can be given over a phone instead of copied character by character. 60 x 50 x 30 is 90,000 combinations, drawn with `crypto.randomInt`.
 
-You can also just pick your own: `/standup` or `/demo-friday` works. Any id is lowercased, canonicalised with a redirect, and must match `^[a-z0-9][a-z0-9-]{0,39}$` — anything else is a 404. That charset is load-bearing, since the id is interpolated into the page and into a JS string literal.
+No accents and no cedillas: the id has to survive `ROOM_ID_RE`, a URL bar, and being spelled out loud. No digits either — a number is the part people mishear.
+
+You can also just pick your own: `/standup` or `/demo-friday` works. Any id is lowercased, canonicalised with a redirect, and must match `^[a-z0-9][a-z0-9-]{0,39}$` — anything else is a 404. That charset is load-bearing, since the id is interpolated into the page and into a JS string literal. `admin` and `healthz` are reserved, since those paths are pages of their own.
+
+Rooms are ephemeral, so a collision only matters if both rooms are live at the same moment; with a handful of concurrent rooms that is remote, and the cost is landing in a stranger's room rather than anything persistent.
 
 ## Architecture
 
@@ -102,9 +106,20 @@ Every action works by closing sockets rather than editing a room in place. The `
 
 Rename is a move, not a relabel. The room id is in every client's URL and in each socket's closure, so instead of rewriting that state the panel sends everyone to the new URL and lets them form the room again there. A page load cannot carry a `MediaStream`, so the broadcaster has to pick a screen again — which is why the confirm dialog says so.
 
+## Live measurements
+
+The broadcaster and every viewer sample `getStats()` every 2s and send a summary up the socket; the server keeps only the newest sample per participant and `/admin` polls it at the same cadence. Nothing is stored or kept as history — it is a gauge, not a time series, and a sample older than 8s is dropped rather than shown stale.
+
+The broadcaster reports send bitrate, resolution, fps, mean encode time per frame, `qualityLimitationReason`, and how many parallel encodes it is running. Each viewer reports receive bitrate, fps, resolution, RTT, jitter, jitter-buffer delay and freeze count. Between them they separate the three different things that all get called "lag": **encode time** says the broadcaster's machine cannot keep up, **delay and freezes** say the network between them cannot, and **encodes Nx** says the mesh is the problem.
+
+Values that matter are coloured: encode time over 20ms, delay over 400ms, loss over 3%, fps under 15.
+
+`/admin` can also pin a quality tier, or cap bitrate and framerate outright. While a tier is pinned the monitor keeps measuring but stops steering, so an operator's choice is not undone six seconds later. Framerate is the cap that actually cuts latency on a screen share — halving fps halves what the encoder and the uplink have to keep up with, where a resolution change only shrinks each frame. Client-supplied numbers are coerced and clamped server-side before they ever reach the page.
+
 ## Known limitations
 
-- **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. This is the real ceiling on audience size, and lifting it means simulcast or an SFU rather than a change to this file.
+
+- **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. This is the real ceiling on audience size, and lifting it means simulcast or an SFU rather than a change to this file. The `encodes Nx` figure in `/admin` is how you tell whether you are hitting it: with one viewer the mesh is not the problem, whatever else is.
 - **STUN only, no TURN.** On symmetric NAT or a corporate network the peer connection simply fails, with no relay to fall back on. Fixing it means running coturn and opening UDP ports, which also puts video bandwidth back on a server.
 - **Deployment is manual.** Nothing in the repo provisions `live.allanpinheiro.com`; the process has to be run and fronted by TLS somewhere. WebRTC screen capture requires a secure context, so plain HTTP only works on `localhost`.
 
