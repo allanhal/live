@@ -80,7 +80,7 @@ wss.on("connection", (ws, req) => {
 
   const url = new URL(req.url, "http://localhost");
   const roomId = url.searchParams.get("room");
-  if (!roomId) return ws.close(4000, "missing room");
+  if (!validRoomId(roomId)) return ws.close(4000, "invalid room");
 
   // Resolved on join rather than on connect. A socket that never joins should
   // not conjure a room, and a room created here could be swept before the join
@@ -192,6 +192,15 @@ function newRoomId() {
 // permissive lets people pick their own room, e.g. /standup.
 const ROOM_ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
+// Paths that are pages in their own right. They match ROOM_ID_RE, so without
+// this a socket could still open a room named after one — reachable over the
+// socket but not over HTTP, since the route serves the page instead.
+const RESERVED_IDS = new Set(["admin", "healthz"]);
+
+function validRoomId(id) {
+  return typeof id === "string" && ROOM_ID_RE.test(id) && !RESERVED_IDS.has(id);
+}
+
 // --- HTTP routes ---
 
 app.get("/", (_req, res) => {
@@ -280,7 +289,7 @@ function adminKickViewer(id, viewerId) {
 function adminRenameRoom(id, to) {
   const room = rooms.get(id);
   if (!room) return { ok: false, error: "no such room" };
-  if (!ROOM_ID_RE.test(to)) return { ok: false, error: "invalid room id" };
+  if (!validRoomId(to)) return { ok: false, error: "invalid room id" };
   if (to === id) return { ok: false, error: "same room id" };
   if (rooms.has(to)) return { ok: false, error: "room id already in use" };
 
@@ -422,7 +431,7 @@ app.use("/admin/api", adminApi);
 
 app.get("/:roomId", (req, res) => {
   const roomId = req.params.roomId.toLowerCase();
-  if (!ROOM_ID_RE.test(roomId)) return res.status(404).type("text").send("Not found");
+  if (!validRoomId(roomId)) return res.status(404).type("text").send("Not found");
   // Canonicalise so the URL people share is the one the room is keyed on.
   if (roomId !== req.params.roomId) return res.redirect(`/${roomId}`);
   res.type("html").send(PAGE_HTML.replace(/__ROOM_ID__/g, roomId));

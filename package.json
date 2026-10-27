@@ -5,5 +5,9 @@
   "dependencies": {
     "express": "^4.21.0",
     "ws": "^8.18.0"
+  },
+  "scripts": {
+    "start": "node live.js",
+    "deploy": "scripts/deploy.sh"
   }
 }
