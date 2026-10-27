@@ -1133,7 +1133,10 @@ function roomCard(room, now) {
   const rename = document.createElement("button");
   rename.textContent = "Rename";
   rename.onclick = () => {
-    const to = prompt("Move " + room.id + " to which room id?\n\nEveryone is redirected to the new URL. The broadcaster has to pick a screen again.", room.id);
+    // Double-escaped on purpose: this page is a template literal, so a single
+    // backslash-n is consumed here and emitted as a real line break inside the
+    // string literal below, which is a parse error for the whole script.
+    const to = prompt("Move " + room.id + " to which room id?\\n\\nEveryone is redirected to the new URL. The broadcaster has to pick a screen again.", room.id);
     if (!to) return;
     act("Moved " + room.id + " to " + to.toLowerCase().trim(),
         "/rooms/" + encodeURIComponent(room.id) + "/rename",
