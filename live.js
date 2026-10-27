@@ -6,6 +6,11 @@ const { WebSocketServer } = require("ws");
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || "https://live.allanpinheiro.com";
 
+// The default is deliberately trivial because that is what was asked for. Any
+// deployment reachable from outside should set ADMIN_PASSWORD: /admin can end
+// every stream on the server.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "1111";
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -17,7 +22,9 @@ const wss = new WebSocketServer({ server });
 const rooms = new Map();
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { broadcaster: null, viewers: new Map() });
+  if (!rooms.has(id)) {
+    rooms.set(id, { broadcaster: null, viewers: new Map(), createdAt: Date.now() });
+  }
   return rooms.get(id);
 }
 
@@ -67,6 +74,7 @@ wss.on("close", () => clearInterval(heartbeat));
 
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
+  ws.joinedAt = Date.now();
   ws.on("pong", () => { ws.isAlive = true; });
   ws.on("error", () => ws.terminate());
 
@@ -200,6 +208,218 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
+// --- Admin ---
+
+// Everything the panel does to a room is done by closing sockets, never by
+// editing a room in place: the close handlers already know how to notify the
+// other side and tidy up, and clients reconnect on their own. The only thing
+// an admin action adds is a reason code the page can show instead of silently
+// retrying.
+const ADMIN_CODES = {
+  closed: 4010,   // room shut down
+  kicked: 4011,   // this socket removed
+  moved: 4012,    // room renamed, go to the new URL
+  reset: 4013,    // whole server flushed
+};
+
+function socketsOf(room) {
+  const list = [];
+  if (room.broadcaster) list.push(room.broadcaster);
+  for (const v of room.viewers.values()) list.push(v);
+  return list;
+}
+
+function evict(ws, kind, payload) {
+  // A reset sweeps the rooms and then every remaining socket, so the same
+  // socket can be reached twice; it should still only hear about it once.
+  if (ws.evicting) return;
+  ws.evicting = true;
+  send(ws, Object.assign({ type: "admin-" + kind }, payload));
+  // Let the frame leave before the FIN; a close() in the same tick can beat
+  // the message out and the client only sees an unexplained drop.
+  setTimeout(() => {
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+      ws.close(ADMIN_CODES[kind], kind);
+    }
+  }, 50);
+}
+
+function adminCloseRoom(id) {
+  const room = rooms.get(id);
+  if (!room) return false;
+  const sockets = socketsOf(room);
+  rooms.delete(id);
+  for (const ws of sockets) evict(ws, "closed");
+  console.log(`[${id}] room closed by admin (${sockets.length} sockets)`);
+  return true;
+}
+
+function adminStopBroadcast(id) {
+  const room = rooms.get(id);
+  if (!room || !room.broadcaster) return false;
+  // Only the broadcaster goes. Its close handler tells the viewers the stream
+  // ended, and they keep waiting in the room for the next one.
+  evict(room.broadcaster, "kicked");
+  console.log(`[${id}] broadcaster stopped by admin`);
+  return true;
+}
+
+function adminKickViewer(id, viewerId) {
+  const room = rooms.get(id);
+  const ws = room && room.viewers.get(viewerId);
+  if (!ws) return false;
+  evict(ws, "kicked");
+  console.log(`[${id}] viewer ${viewerId} kicked by admin`);
+  return true;
+}
+
+// Renaming is a move, not a relabel: the room id is baked into every client's
+// URL and socket closure, so instead of rewriting that state we send everyone
+// to the new URL and let them rebuild the room there. The broadcaster has to
+// pick its screen again — a page load cannot carry a MediaStream across.
+function adminRenameRoom(id, to) {
+  const room = rooms.get(id);
+  if (!room) return { ok: false, error: "no such room" };
+  if (!ROOM_ID_RE.test(to)) return { ok: false, error: "invalid room id" };
+  if (to === id) return { ok: false, error: "same room id" };
+  if (rooms.has(to)) return { ok: false, error: "room id already in use" };
+
+  const sockets = socketsOf(room);
+  rooms.delete(id);
+  for (const ws of sockets) evict(ws, "moved", { roomId: to });
+  console.log(`[${id}] renamed to ${to} by admin (${sockets.length} sockets)`);
+  return { ok: true, moved: sockets.length };
+}
+
+function adminReset() {
+  const counts = { rooms: rooms.size, sockets: wss.clients.size };
+  for (const [, room] of rooms) {
+    for (const ws of socketsOf(room)) evict(ws, "reset");
+  }
+  rooms.clear();
+  // Sockets that connected but never joined hold no room, so the loop above
+  // misses them; a reset means nobody is left holding a stale socket.
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN && !ws.evicting) evict(ws, "reset");
+  }
+  console.log(`[admin] server state reset (${counts.rooms} rooms, ${counts.sockets} sockets)`);
+  return counts;
+}
+
+function roomState() {
+  const out = [];
+  for (const [id, room] of rooms) {
+    out.push({
+      id,
+      live: Boolean(room.broadcaster),
+      viewers: [...room.viewers.keys()].map((viewerId) => ({
+        viewerId,
+        joinedAt: room.viewers.get(viewerId).joinedAt || null,
+      })),
+      createdAt: room.createdAt || null,
+    });
+  }
+  out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return out;
+}
+
+// --- Admin auth ---
+
+// A four-digit password is guessable in a few thousand requests, so the
+// throttle is load-bearing here rather than decorative.
+const ADMIN_MAX_FAILURES = 8;
+const ADMIN_LOCKOUT_MS = 60_000;
+const adminFailures = new Map(); // ip -> { count, until }
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(String(value)).digest();
+}
+
+function passwordOk(given) {
+  // timingSafeEqual needs equal lengths, which the raw strings do not have;
+  // comparing digests keeps the comparison constant-time either way.
+  return crypto.timingSafeEqual(sha256(given), sha256(ADMIN_PASSWORD));
+}
+
+function requireAdmin(req, res, next) {
+  const ip = req.ip || "unknown";
+  const record = adminFailures.get(ip);
+  if (record && record.until > Date.now()) {
+    const wait = Math.ceil((record.until - Date.now()) / 1000);
+    return res.status(429).json({ error: `too many attempts, retry in ${wait}s` });
+  }
+
+  const given = req.get("x-admin-password");
+  if (typeof given === "string" && passwordOk(given)) {
+    adminFailures.delete(ip);
+    return next();
+  }
+
+  const count = (record ? record.count : 0) + 1;
+  adminFailures.set(ip, {
+    count,
+    until: count >= ADMIN_MAX_FAILURES ? Date.now() + ADMIN_LOCKOUT_MS : 0,
+  });
+  res.status(401).json({ error: "unauthorized" });
+}
+
+// Registered before :roomId, which would otherwise serve "admin" as a room.
+app.get("/admin", (_req, res) => {
+  res.type("html").send(ADMIN_HTML);
+});
+
+const adminApi = express.Router();
+adminApi.use(express.json({ limit: "4kb" }));
+adminApi.use(requireAdmin);
+
+adminApi.get("/state", (_req, res) => {
+  res.json({
+    rooms: roomState(),
+    server: {
+      clients: wss.clients.size,
+      uptime: Math.round(process.uptime()),
+      memoryMb: Math.round(process.memoryUsage().rss / 1048576),
+      now: Date.now(),
+    },
+  });
+});
+
+adminApi.post("/rooms/:roomId/stop", (req, res) => {
+  const ok = adminStopBroadcast(req.params.roomId);
+  res.status(ok ? 200 : 404).json(ok ? { ok: true } : { error: "no live broadcaster" });
+});
+
+adminApi.post("/rooms/:roomId/rename", (req, res) => {
+  const to = String((req.body && req.body.to) || "").toLowerCase().trim();
+  const result = adminRenameRoom(req.params.roomId, to);
+  res.status(result.ok ? 200 : 400).json(result);
+});
+
+adminApi.post("/rooms/:roomId/viewers/:viewerId/kick", (req, res) => {
+  const ok = adminKickViewer(req.params.roomId, req.params.viewerId);
+  res.status(ok ? 200 : 404).json(ok ? { ok: true } : { error: "no such viewer" });
+});
+
+adminApi.delete("/rooms/:roomId", (req, res) => {
+  const ok = adminCloseRoom(req.params.roomId);
+  res.status(ok ? 200 : 404).json(ok ? { ok: true } : { error: "no such room" });
+});
+
+adminApi.post("/reset", (_req, res) => {
+  res.json({ ok: true, ...adminReset() });
+});
+
+// A restart is only a restart if something brings the process back, so it is
+// reported as an exit and left to the supervisor (systemd, pm2, Docker).
+adminApi.post("/restart", (_req, res) => {
+  adminReset();
+  res.json({ ok: true, exiting: true });
+  console.log("[admin] exiting for restart");
+  setTimeout(() => process.exit(0), 250);
+});
+
+app.use("/admin/api", adminApi);
+
 app.get("/:roomId", (req, res) => {
   const roomId = req.params.roomId.toLowerCase();
   if (!ROOM_ID_RE.test(roomId)) return res.status(404).type("text").send("Not found");
@@ -325,6 +545,9 @@ const volumeSlider = document.getElementById("volume-slider");
 
 let role = null;
 let ws = null;
+// Set once an admin action explains the disconnect. The reconnect timer would
+// otherwise rebuild the room we were just removed from, a second later.
+let evicted = false;
 let localStream = null;
 const peerConnections = new Map(); // viewerId -> RTCPeerConnection
 const waitingViewers = new Set();  // viewerIds announced before we had a stream
@@ -406,6 +629,26 @@ function connect() {
         setStatus("red", "Broadcaster disconnected");
         break;
 
+      // --- Admin events ---
+      case "admin-moved":
+        evicted = true;
+        location.replace("/" + msg.roomId);
+        break;
+
+      case "admin-closed":
+        endSession("This room was closed by an admin");
+        break;
+
+      case "admin-kicked":
+        endSession(role === "broadcaster"
+          ? "Your broadcast was stopped by an admin"
+          : "You were removed from this room by an admin");
+        break;
+
+      case "admin-reset":
+        endSession("The server was reset by an admin");
+        break;
+
       case "ice-candidate":
         if (role === "broadcaster" && msg.viewerId) {
           const pc = peerConnections.get(msg.viewerId);
@@ -418,9 +661,36 @@ function connect() {
   };
 
   ws.onclose = () => {
+    if (evicted) return;
     setStatus("red", "Disconnected — reconnecting in 3s...");
     setTimeout(connect, 3000);
   };
+}
+
+// Tear the session down for good: no reconnect, no half-live video, and a
+// reload is the only way back in.
+function endSession(message) {
+  evicted = true;
+  setStatus("red", message);
+  if (localStream) {
+    for (const track of localStream.getTracks()) track.stop();
+    localStream = null;
+  }
+  for (const [, pc] of peerConnections) pc.close();
+  peerConnections.clear();
+  waitingViewers.clear();
+  stopQualityMonitor();
+  if (viewerPC) {
+    viewerPC.close();
+    viewerPC = null;
+  }
+  video.srcObject = null;
+  startBtn.style.display = "none";
+  volumeEl.style.display = "none";
+  waitingEl.textContent = message;
+  waitingEl.style.display = "block";
+  viewersEl.textContent = "";
+  infoEl.textContent = "Reload the page to join again.";
 }
 
 // --- Broadcaster logic ---
@@ -689,6 +959,330 @@ connect();
 </body>
 </html>`;
 
+// --- Embedded admin page ---
+
+const ADMIN_HTML = /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Admin — Live Stream</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0a0a0a; color: #e0e0e0;
+    min-height: 100vh; padding: 24px 16px 48px;
+  }
+  main { max-width: 820px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+  .sub { font-size: 13px; color: #666; margin-bottom: 24px; }
+  .card {
+    background: #121212; border: 1px solid #1f1f1f; border-radius: 8px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .grow { flex: 1 1 180px; min-width: 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .dot-green { background: #38a169; animation: pulse 2s infinite; }
+  .dot-yellow { background: #d69e2e; }
+  .dot-red { background: #e53e3e; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .room-id { font-size: 16px; font-weight: 600; }
+  .room-id a { color: inherit; text-decoration: none; border-bottom: 1px dotted #555; }
+  .meta { font-size: 12px; color: #777; margin-top: 4px; }
+  button, input {
+    font-family: inherit; font-size: 13px;
+  }
+  button {
+    padding: 7px 12px; border-radius: 6px; border: 1px solid #333;
+    background: #1c1c1c; color: #e0e0e0; cursor: pointer;
+  }
+  button:hover { background: #262626; }
+  button.danger { border-color: #5a2222; color: #ff8f8f; }
+  button.danger:hover { background: #2a1414; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input[type=text], input[type=password] {
+    padding: 8px 10px; border-radius: 6px; border: 1px solid #333;
+    background: #0e0e0e; color: #e0e0e0; min-width: 0;
+  }
+  input:focus-visible, button:focus-visible { outline: 2px solid #4a90d9; outline-offset: 2px; }
+  .viewers { margin-top: 12px; border-top: 1px solid #1f1f1f; padding-top: 10px; display: grid; gap: 6px; }
+  .viewer { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #999; }
+  .viewer .grow { flex: 1; }
+  .empty { color: #666; font-size: 14px; text-align: center; padding: 24px 0; }
+  #msg { font-size: 13px; min-height: 18px; margin-bottom: 12px; color: #999; }
+  #msg.err { color: #ff8f8f; }
+  #msg.ok { color: #7ddba1; }
+  .login { max-width: 320px; margin: 15vh auto 0; }
+  .login .row { margin-top: 12px; }
+  .footer-stats { font-size: 12px; color: #777; }
+  .warn { font-size: 12px; color: #a08040; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<main>
+  <div id="login" class="login card" style="display:none">
+    <h1>Admin</h1>
+    <div class="sub">Enter the admin password.</div>
+    <form id="login-form">
+      <input id="pw" type="password" placeholder="Password" autocomplete="current-password" style="width:100%">
+      <div class="row"><button type="submit">Sign in</button><span id="login-msg" style="font-size:13px;color:#ff8f8f"></span></div>
+    </form>
+  </div>
+
+  <div id="panel" style="display:none">
+    <h1>Live Stream admin</h1>
+    <div class="sub">Rooms exist only while someone is connected; an empty room disappears on its own.</div>
+    <div id="msg"></div>
+    <div id="rooms"></div>
+
+    <div class="card">
+      <div class="row">
+        <div class="grow footer-stats" id="stats"></div>
+        <button id="refresh">Refresh</button>
+        <button class="danger" id="reset">Reset state</button>
+        <button class="danger" id="restart">Restart process</button>
+        <button id="logout">Sign out</button>
+      </div>
+      <div class="warn">Reset state drops every room and connection. Restart process exits the server — it only comes back if a supervisor restarts it.</div>
+    </div>
+  </div>
+</main>
+
+<script>
+const loginEl = document.getElementById("login");
+const loginForm = document.getElementById("login-form");
+const loginMsg = document.getElementById("login-msg");
+const pwInput = document.getElementById("pw");
+const panelEl = document.getElementById("panel");
+const roomsEl = document.getElementById("rooms");
+const statsEl = document.getElementById("stats");
+const msgEl = document.getElementById("msg");
+
+const PW_KEY = "live:admin-pw";
+let password = null;
+let timer = null;
+
+function say(text, kind) {
+  msgEl.textContent = text || "";
+  msgEl.className = kind || "";
+}
+
+async function api(path, options) {
+  const opts = Object.assign({ headers: {} }, options || {});
+  opts.headers = Object.assign({ "x-admin-password": password }, opts.headers);
+  if (opts.body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const res = await fetch("/admin/api" + path, opts);
+  let body = {};
+  try { body = await res.json(); } catch {}
+  if (!res.ok) throw new Error(body.error || res.status + " " + res.statusText);
+  return body;
+}
+
+function ago(ts, now) {
+  if (!ts) return "unknown";
+  const secs = Math.max(0, Math.round((now - ts) / 1000));
+  if (secs < 60) return secs + "s";
+  if (secs < 3600) return Math.floor(secs / 60) + "m " + (secs % 60) + "s";
+  return Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m";
+}
+
+// Built node by node rather than as an HTML string: room ids are user-chosen
+// and go straight back into this page.
+function roomCard(room, now) {
+  const card = document.createElement("div");
+  card.className = "card";
+
+  const head = document.createElement("div");
+  head.className = "row";
+
+  const title = document.createElement("div");
+  title.className = "grow";
+
+  const idLine = document.createElement("div");
+  idLine.className = "room-id";
+  const dot = document.createElement("span");
+  dot.className = "dot dot-" + (room.live ? "green" : "yellow");
+  const link = document.createElement("a");
+  link.href = "/" + room.id;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = room.id;
+  idLine.append(dot, link);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = (room.live ? "live" : "waiting for broadcaster")
+    + " · " + room.viewers.length + " viewer" + (room.viewers.length === 1 ? "" : "s")
+    + " · open " + ago(room.createdAt, now);
+
+  title.append(idLine, meta);
+  head.append(title);
+
+  const stop = document.createElement("button");
+  stop.textContent = "Stop stream";
+  stop.disabled = !room.live;
+  stop.onclick = () => act("Stopped broadcast in " + room.id, "/rooms/" + encodeURIComponent(room.id) + "/stop", { method: "POST" });
+
+  const rename = document.createElement("button");
+  rename.textContent = "Rename";
+  rename.onclick = () => {
+    const to = prompt("Move " + room.id + " to which room id?\n\nEveryone is redirected to the new URL. The broadcaster has to pick a screen again.", room.id);
+    if (!to) return;
+    act("Moved " + room.id + " to " + to.toLowerCase().trim(),
+        "/rooms/" + encodeURIComponent(room.id) + "/rename",
+        { method: "POST", body: { to: to } });
+  };
+
+  const close = document.createElement("button");
+  close.className = "danger";
+  close.textContent = "Close room";
+  close.onclick = () => {
+    if (!confirm("Close " + room.id + "? Everyone in it is disconnected.")) return;
+    act("Closed " + room.id, "/rooms/" + encodeURIComponent(room.id), { method: "DELETE" });
+  };
+
+  head.append(stop, rename, close);
+  card.append(head);
+
+  if (room.viewers.length) {
+    const list = document.createElement("div");
+    list.className = "viewers";
+    for (const viewer of room.viewers) {
+      const line = document.createElement("div");
+      line.className = "viewer";
+      const label = document.createElement("span");
+      label.className = "grow";
+      label.textContent = "viewer " + viewer.viewerId + " · " + ago(viewer.joinedAt, now);
+      const kick = document.createElement("button");
+      kick.textContent = "Kick";
+      kick.onclick = () => act("Kicked viewer " + viewer.viewerId,
+        "/rooms/" + encodeURIComponent(room.id) + "/viewers/" + encodeURIComponent(viewer.viewerId) + "/kick",
+        { method: "POST" });
+      line.append(label, kick);
+      list.append(line);
+    }
+    card.append(list);
+  }
+
+  return card;
+}
+
+async function act(successMessage, path, options) {
+  try {
+    await api(path, options);
+    say(successMessage, "ok");
+  } catch (err) {
+    say(err.message, "err");
+  }
+  await refresh();
+}
+
+async function refresh() {
+  let state;
+  try {
+    state = await api("/state");
+  } catch (err) {
+    if (/unauthorized/i.test(err.message)) return signOut("Session expired — sign in again.");
+    say(err.message, "err");
+    return;
+  }
+
+  const now = state.server.now;
+  roomsEl.textContent = "";
+  if (!state.rooms.length) {
+    const empty = document.createElement("div");
+    empty.className = "card empty";
+    empty.textContent = "No active rooms.";
+    roomsEl.append(empty);
+  } else {
+    for (const room of state.rooms) roomsEl.append(roomCard(room, now));
+  }
+
+  statsEl.textContent = state.rooms.length + " room" + (state.rooms.length === 1 ? "" : "s")
+    + " · " + state.server.clients + " socket" + (state.server.clients === 1 ? "" : "s")
+    + " · up " + ago(now - state.server.uptime * 1000, now)
+    + " · " + state.server.memoryMb + " MB";
+}
+
+function startPolling() {
+  loginEl.style.display = "none";
+  panelEl.style.display = "block";
+  refresh();
+  // Rooms come and go with their sockets, so the list is only true as of its
+  // last fetch; poll rather than let it drift.
+  clearInterval(timer);
+  timer = setInterval(refresh, 3000);
+}
+
+function signOut(message) {
+  clearInterval(timer);
+  password = null;
+  try { sessionStorage.removeItem(PW_KEY); } catch {}
+  panelEl.style.display = "none";
+  loginEl.style.display = "block";
+  loginMsg.textContent = message || "";
+  pwInput.value = "";
+  pwInput.focus();
+}
+
+loginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  loginMsg.textContent = "";
+  password = pwInput.value;
+  try {
+    await api("/state");
+    // sessionStorage, not localStorage: the password is gone when the tab is.
+    try { sessionStorage.setItem(PW_KEY, password); } catch {}
+    startPolling();
+  } catch (err) {
+    password = null;
+    loginMsg.textContent = err.message;
+  }
+});
+
+document.getElementById("refresh").onclick = () => refresh();
+document.getElementById("logout").onclick = () => signOut();
+
+document.getElementById("reset").onclick = async () => {
+  if (!confirm("Reset server state? Every room and connection is dropped.")) return;
+  await act("Server state reset", "/reset", { method: "POST" });
+};
+
+document.getElementById("restart").onclick = async () => {
+  if (!confirm("Restart the process? If nothing supervises this server, it stays down.")) return;
+  try {
+    await api("/restart", { method: "POST" });
+    say("Exiting — waiting for the server to come back...", "ok");
+  } catch (err) {
+    say(err.message, "err");
+  }
+};
+
+(async () => {
+  let stored = null;
+  try { stored = sessionStorage.getItem(PW_KEY); } catch {}
+  if (stored) {
+    password = stored;
+    try {
+      await api("/state");
+      return startPolling();
+    } catch {
+      password = null;
+    }
+  }
+  signOut();
+})();
+</script>
+</body>
+</html>`;
+
 server.listen(PORT, () => {
   const roomId = newRoomId();
   console.log("");
@@ -696,6 +1290,7 @@ server.listen(PORT, () => {
   console.log("");
   console.log("  Local:   http://localhost:" + PORT + "/" + roomId);
   console.log("  Public:  " + PUBLIC_ORIGIN + "/" + roomId);
+  console.log("  Admin:   http://localhost:" + PORT + "/admin");
   console.log("");
   console.log("  Open the local link to start broadcasting,");
   console.log("  then share the public link with viewers.");

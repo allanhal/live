@@ -92,6 +92,16 @@ A broadcaster leaving does **not** evict the viewers — they stay connected and
 
 A viewer's stream starts muted, because an unmuted `play()` is blocked by autoplay policy and the result is a black frame rather than a prompt. The viewer gets a mute toggle and a volume slider over the bottom-right of the video; the first move of either one is the unmute, and the level is kept in `localStorage` so the next room opens at the same volume. A level of 0 is not stored — otherwise a visit that ended silent would start the next one silent with nothing to explain it.
 
+## Admin panel
+
+`GET /admin` is a password-gated panel over the live room map. The password is `1111` by default — set `ADMIN_PASSWORD` anywhere the server is reachable from outside, because this page can end every stream on it. The password is sent as an `x-admin-password` header on each API call and held in `sessionStorage`, so it is gone when the tab is; eight wrong tries lock an IP out of `/admin/api/*` for a minute.
+
+Per room: **stop stream** (drops the broadcaster, viewers stay waiting), **rename**, **close room** (disconnects everyone), and **kick** on each viewer. Below the list: **reset state** (drops every room and connection) and **restart process** (`process.exit(0)` — it only comes back if a supervisor restarts it).
+
+Every action works by closing sockets rather than editing a room in place. The `close` handlers already know how to notify the other side and tidy up, so an admin action only adds a reason the client can show: the page stops its reconnect loop and says what happened instead of silently rebuilding the room it was just removed from. Close codes are 4010 closed, 4011 kicked, 4012 moved, 4013 reset.
+
+Rename is a move, not a relabel. The room id is in every client's URL and in each socket's closure, so instead of rewriting that state the panel sends everyone to the new URL and lets them form the room again there. A page load cannot carry a `MediaStream`, so the broadcaster has to pick a screen again — which is why the confirm dialog says so.
+
 ## Known limitations
 
 - **Mesh topology.** The broadcaster opens one `RTCPeerConnection` per viewer with no simulcast, so each viewer costs another full 1080p60 encode. This is the real ceiling on audience size, and lifting it means simulcast or an SFU rather than a change to this file.
