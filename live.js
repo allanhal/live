@@ -88,6 +88,7 @@ wss.on("connection", (ws, req) => {
   // the next person to join the same URL got a different one.
   let room = null;
   let role = null;
+  let clientId = null;
 
   ws.on("message", (raw) => {
     let msg;
@@ -97,7 +98,36 @@ wss.on("connection", (ws, req) => {
       case "join": {
         if (room) break;
         room = getRoom(roomId);
-        if (!room.broadcaster) {
+
+        // The client's own id, not one minted per socket. A reconnecting
+        // viewer has to come back under the id the broadcaster already has a
+        // peer connection keyed on, or the broadcaster treats it as a new
+        // arrival and opens a second connection to someone it is already
+        // streaming to. Falls back to a server id for anything that does not
+        // send one.
+        clientId = CLIENT_ID_RE.test(String(msg.clientId)) ? msg.clientId : idFor(ws);
+        ws.clientId = clientId;
+
+        // Whatever is still registered under this id is a socket that has not
+        // noticed it is dead yet -- that is what a reconnect means. Drop it
+        // rather than keeping two entries for one client.
+        if (room.broadcaster && room.broadcaster !== ws && room.broadcaster.clientId === clientId) {
+          const stale = room.broadcaster;
+          room.broadcaster = null;
+          stale.terminate();
+        }
+        const staleViewer = room.viewers.get(clientId);
+        if (staleViewer && staleViewer !== ws) {
+          room.viewers.delete(clientId);
+          staleViewer.terminate();
+        }
+
+        // Role is still first-come for a fresh visitor, but a client that says
+        // it was a viewer never takes the broadcaster slot. Without that, a
+        // restart is a race: every client reconnects at once and whichever
+        // viewer wins becomes the broadcaster of an empty room while the real
+        // broadcaster, still holding the screen, is demoted to viewer.
+        if (!room.broadcaster && msg.role !== "viewer") {
           role = "broadcaster";
           room.broadcaster = ws;
           send(ws, { type: "role", role: "broadcaster" });
@@ -107,13 +137,13 @@ wss.on("connection", (ws, req) => {
           for (const viewerId of room.viewers.keys()) {
             send(ws, { type: "viewer-joined", viewerId });
           }
-          console.log(`[${roomId}] broadcaster connected (${room.viewers.size} viewers waiting)`);
+          console.log(`[${roomId}] broadcaster connected as ${clientId} (${room.viewers.size} viewers waiting)`);
         } else {
           role = "viewer";
-          room.viewers.set(idFor(ws), ws);
+          room.viewers.set(clientId, ws);
           send(ws, { type: "role", role: "viewer" });
-          send(room.broadcaster, { type: "viewer-joined", viewerId: idFor(ws) });
-          console.log(`[${roomId}] viewer connected (${room.viewers.size} total)`);
+          send(room.broadcaster, { type: "viewer-joined", viewerId: clientId });
+          console.log(`[${roomId}] viewer ${clientId} connected (${room.viewers.size} total)`);
         }
         break;
       }
@@ -126,7 +156,7 @@ wss.on("connection", (ws, req) => {
           const target = room.viewers.get(msg.viewerId);
           if (target) send(target, { type: msg.type, data: msg.data });
         } else if (role === "viewer" && room.broadcaster) {
-          send(room.broadcaster, { type: msg.type, data: msg.data, viewerId: idFor(ws) });
+          send(room.broadcaster, { type: msg.type, data: msg.data, viewerId: clientId });
         }
         break;
       }
@@ -136,6 +166,7 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     if (!room) return;
     if (role === "broadcaster") {
+      if (room.broadcaster !== ws) return; // replaced by a reconnect; not ours to clear
       room.broadcaster = null;
       for (const v of room.viewers.values()) send(v, { type: "broadcaster-left" });
       // Keep the viewers: they are still connected and waiting, and clearing
@@ -143,9 +174,14 @@ wss.on("connection", (ws, req) => {
       // broadcaster got a fresh room object the old viewers were not in.
       console.log(`[${roomId}] broadcaster disconnected (${room.viewers.size} viewers waiting)`);
     } else if (role === "viewer") {
-      room.viewers.delete(idFor(ws));
-      if (room.broadcaster) {
-        send(room.broadcaster, { type: "viewer-left", viewerId: idFor(ws) });
+      // Only if this socket is still the one registered: a reconnect under the
+      // same id replaces the entry, and the old socket's close must not then
+      // delete the new one or tell the broadcaster that a live viewer left.
+      if (room.viewers.get(clientId) === ws) {
+        room.viewers.delete(clientId);
+        if (room.broadcaster) {
+          send(room.broadcaster, { type: "viewer-left", viewerId: clientId });
+        }
       }
       console.log(`[${roomId}] viewer disconnected (${room.viewers.size} remaining)`);
     }
@@ -196,6 +232,10 @@ const ROOM_ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 // this a socket could still open a room named after one — reachable over the
 // socket but not over HTTP, since the route serves the page instead.
 const RESERVED_IDS = new Set(["admin", "healthz"]);
+
+// Client-supplied, so it is a map key and goes into the admin page and into a
+// URL path. Keep it to something that cannot be either of those things.
+const CLIENT_ID_RE = /^[a-z0-9-]{1,40}$/;
 
 function validRoomId(id) {
   return typeof id === "string" && ROOM_ID_RE.test(id) && !RESERVED_IDS.has(id);
@@ -557,9 +597,25 @@ let ws = null;
 // Set once an admin action explains the disconnect. The reconnect timer would
 // otherwise rebuild the room we were just removed from, a second later.
 let evicted = false;
+
+// Stable for the life of the tab, so a reconnect comes back as the same
+// participant: the broadcaster keeps its peer connections keyed correctly and
+// does not open a second one to a viewer it is already streaming to. Per tab,
+// not per browser, because two tabs are two participants.
+const CLIENT_KEY = "live:client-id";
+let clientId = null;
+try { clientId = sessionStorage.getItem(CLIENT_KEY); } catch {}
+if (!clientId || !/^[a-z0-9-]{1,40}$/.test(clientId)) {
+  clientId = "c-" + Math.random().toString(36).slice(2, 10);
+  try { sessionStorage.setItem(CLIENT_KEY, clientId); } catch {}
+}
 let localStream = null;
 const peerConnections = new Map(); // viewerId -> RTCPeerConnection
 const waitingViewers = new Set();  // viewerIds announced before we had a stream
+
+const RECONNECT_MIN_MS = 400;
+const RECONNECT_MAX_MS = 8000;
+let reconnectDelay = RECONNECT_MIN_MS;
 
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -571,8 +627,12 @@ function connect() {
   ws = new WebSocket(proto + "//" + location.host + "/?room=" + ROOM_ID);
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "join" }));
-    setStatus("yellow", "Joined room, determining role...");
+    reconnectDelay = RECONNECT_MIN_MS;
+    // Claiming the role we already hold is what makes a server restart
+    // survivable: everyone reconnects at once, and without the claim the
+    // broadcaster slot goes to whichever socket lands first.
+    ws.send(JSON.stringify({ type: "join", clientId, role }));
+    if (!role) setStatus("yellow", "Joined room, determining role...");
   };
 
   ws.onmessage = async (e) => {
@@ -593,14 +653,28 @@ function connect() {
           infoEl.textContent = "Share this URL with viewers: " + location.href;
         } else {
           startBtn.style.display = "none";
-          waitingEl.style.display = "block";
-          setStatus("yellow", "Waiting for broadcaster to start...");
+          // A reconnect while the stream is still playing must not put the
+          // "waiting" card back over a live picture.
+          if (video.srcObject) {
+            waitingEl.style.display = "none";
+            setStatus("green", "Watching stream");
+          } else {
+            waitingEl.style.display = "block";
+            setStatus("yellow", "Waiting for broadcaster to start...");
+          }
         }
         break;
 
       // --- Broadcaster events ---
       case "viewer-joined":
         if (role === "broadcaster") {
+          // After a reconnect the server re-announces everyone in the room,
+          // including viewers whose peer connection never dropped -- video is
+          // peer-to-peer and outlived the signaling. Re-offering would build a
+          // second connection to someone already being streamed to.
+          const existing = peerConnections.get(msg.viewerId);
+          if (existing && existing.connectionState !== "failed" && existing.connectionState !== "closed") break;
+          if (existing) existing.close();
           // Before Share Screen there is nothing to offer, so remember them and
           // connect once the stream exists. Without this a viewer who opened
           // the URL first waited forever.
@@ -671,8 +745,18 @@ function connect() {
 
   ws.onclose = () => {
     if (evicted) return;
-    setStatus("red", "Disconnected — reconnecting in 3s...");
-    setTimeout(connect, 3000);
+    // Video is peer-to-peer: a signaling drop does not interrupt a stream that
+    // is already flowing, so say "reconnecting", not "disconnected", and do not
+    // touch the video. Reconnect fast -- a deploy is back within a second or
+    // two -- and back off only if it is really gone.
+    const seconds = Math.round(reconnectDelay / 100) / 10;
+    if (role === "viewer" && video.srcObject) {
+      setStatus("yellow", "Reconnecting to the server (stream still playing)...");
+    } else {
+      setStatus("yellow", "Reconnecting in " + seconds + "s...");
+    }
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   };
 }
 
