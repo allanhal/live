@@ -47,6 +47,7 @@ function pickUplink(d) {
   return {
     kbps: num(d.kbps, 1e6),
     fps: num(d.fps, 240),
+    srcFps: num(d.srcFps, 240),
     width: num(d.width, 16384),
     height: num(d.height, 16384),
     tier: typeof d.tier === "string" ? d.tier.slice(0, 16) : null,
@@ -1000,14 +1001,23 @@ async function applyQualityTier(pc, tierIndex) {
 }
 
 // Byte counters are cumulative, so a rate needs the previous sample.
-const lastSent = new Map(); // viewerId -> { bytes, at }
+const lastSent = new Map(); // viewerId -> { bytes, at, encodeTime, framesEncoded }
 
 async function collectUplinkStats() {
-  let kbps = 0, fps = null, width = null, height = null, limitation = null, encodeMs = null, peers = 0;
+  let kbps = 0, fps = null, srcFps = null, width = null, height = null, limitation = null, encodeMs = null, peers = 0;
   for (const [viewerId, pc] of peerConnections) {
     if (pc.connectionState !== "connected") continue;
     const stats = await pc.getStats();
     for (const r of stats.values()) {
+      // What the screen hands the encoder, before the encoder has a say.
+      // Against the encoded fps it tells the two low-frame-rate stories
+      // apart: a machine that cannot keep up still has frames waiting, a
+      // still screen has none to give, and only the first one is ours to
+      // fix. Every peer shares the one capture, so any report will do.
+      if (r.type === "media-source" && r.kind === "video" && r.framesPerSecond != null) {
+        srcFps = Math.max(srcFps || 0, r.framesPerSecond);
+        continue;
+      }
       if (r.type !== "outbound-rtp" || r.kind !== "video") continue;
       peers++;
       const prev = lastSent.get(viewerId);
@@ -1015,18 +1025,27 @@ async function collectUplinkStats() {
       if (prev && now > prev.at) {
         kbps += ((r.bytesSent - prev.bytes) * 8) / (now - prev.at);
       }
-      lastSent.set(viewerId, { bytes: r.bytesSent, at: now });
       if (r.framesPerSecond != null) fps = Math.max(fps || 0, r.framesPerSecond);
       if (r.frameWidth) { width = r.frameWidth; height = r.frameHeight; }
       if (r.qualityLimitationReason && r.qualityLimitationReason !== "none") limitation = r.qualityLimitationReason;
       // Encode time per frame is the tell for "the machine cannot keep up",
-      // which no amount of bitrate tuning fixes.
-      if (r.totalEncodeTime != null && r.framesEncoded) encodeMs = (r.totalEncodeTime / r.framesEncoded) * 1000;
+      // which no amount of bitrate tuning fixes. Both totals are cumulative,
+      // so the ratio of the totals is the average since the stream began: it
+      // hides a machine that has recovered, and at a low frame rate it never
+      // escapes the expensive first keyframes. Take the interval instead.
+      if (prev && r.framesEncoded > prev.framesEncoded && r.totalEncodeTime != null) {
+        encodeMs = Math.max(encodeMs || 0,
+          ((r.totalEncodeTime - prev.encodeTime) / (r.framesEncoded - prev.framesEncoded)) * 1000);
+      }
+      lastSent.set(viewerId, {
+        bytes: r.bytesSent, at: now,
+        encodeTime: r.totalEncodeTime, framesEncoded: r.framesEncoded,
+      });
     }
   }
   for (const id of [...lastSent.keys()]) if (!peerConnections.has(id)) lastSent.delete(id);
   return {
-    kbps: Math.round(kbps), fps, width, height, peers,
+    kbps: Math.round(kbps), fps, srcFps, width, height, peers,
     tier: QUALITY_TIERS[currentTierIndex].label,
     pinned: pinnedTier !== null,
     limitation, encodeMs,
@@ -1162,6 +1181,7 @@ async function handleOffer(offer) {
 let viewerStatsTimer = null;
 let lastRecv = null;
 let lastJitter = null;
+let lastFreezes = null;
 
 function startViewerStats() {
   if (viewerStatsTimer) return;
@@ -1179,7 +1199,13 @@ function startViewerStats() {
         if (r.framesPerSecond != null) out.fps = r.framesPerSecond;
         if (r.frameWidth) { out.width = r.frameWidth; out.height = r.frameHeight; }
         if (r.jitter != null) out.jitterMs = r.jitter * 1000;
-        if (r.freezeCount != null) out.freezeCount = r.freezeCount;
+        // Cumulative, like the delay totals below: a lifetime count only
+        // ever grows, so it reads as an alarm long after the stream settled.
+        // Report what happened in this sample instead.
+        if (r.freezeCount != null) {
+          if (lastFreezes != null) out.freezeCount = Math.max(0, r.freezeCount - lastFreezes);
+          lastFreezes = r.freezeCount;
+        }
         if (r.packetsLost != null && r.packetsReceived) {
           out.lossPct = (r.packetsLost / (r.packetsLost + r.packetsReceived)) * 100;
         }
@@ -1506,17 +1532,31 @@ function roomCard(room, now) {
   }
 
   const up = room.uplink;
+  // A still screen hands the encoder almost nothing. The low frame rate that
+  // follows is the screen, not a fault, and no tier can raise it -- so say so
+  // once here rather than painting every frame-rate number red.
+  const starved = up && up.srcFps != null && up.srcFps < 5 && !up.limitation;
   if (up) {
     card.append(metricsRow([
       ["up", rate(up.kbps)],
       ["res", up.width ? up.width + "x" + up.height : null],
-      ["fps", up.fps != null ? Math.round(up.fps) : null, up.fps != null && up.fps < 15 ? "bad" : null],
+      ["fps", up.fps != null ? Math.round(up.fps) : null,
+        up.fps != null && up.fps < 15 && !starved ? "bad" : null],
+      ["source", up.srcFps != null ? Math.round(up.srcFps) + " fps" : null, starved ? "warn" : null],
       ["encode", up.encodeMs != null ? Math.round(up.encodeMs) + " ms" : null,
         up.encodeMs > 20 ? "bad" : up.encodeMs > 10 ? "warn" : null],
       ["tier", up.tier + (up.pinned ? " (pinned)" : " (auto)"), up.pinned ? "pinned" : null],
       ["limited by", up.limitation, "warn"],
       ["encodes", up.peers != null ? up.peers + "x" : null, up.peers > 2 ? "warn" : null],
     ]));
+    if (starved) {
+      const note = document.createElement("div");
+      note.className = "warn";
+      note.textContent = "The captured screen is producing almost no frames — it is idle, " +
+        "hidden, or an inactive display. Quality tiers cannot raise this; the broadcaster " +
+        "has to re-pick the share.";
+      card.append(note);
+    }
   } else if (room.live) {
     card.append(metricsRow([["up", "no samples yet — broadcaster has not started sharing", "k"]]));
   }
@@ -1569,13 +1609,14 @@ function roomCard(room, now) {
         const st = viewer.stats;
         const row = metricsRow([
           ["down", rate(st.kbps)],
-          ["fps", st.fps != null ? Math.round(st.fps) : null, st.fps != null && st.fps < 15 ? "bad" : null],
+          ["fps", st.fps != null ? Math.round(st.fps) : null,
+            st.fps != null && st.fps < 15 && !starved ? "bad" : null],
           ["res", st.width ? st.width + "x" + st.height : null],
           ["delay", ms(st.delayMs), st.delayMs > 400 ? "bad" : st.delayMs > 150 ? "warn" : null],
           ["rtt", ms(st.rttMs), st.rttMs > 200 ? "warn" : null],
           ["loss", st.lossPct != null ? st.lossPct.toFixed(1) + "%" : null,
             st.lossPct > 3 ? "bad" : st.lossPct > 0.5 ? "warn" : null],
-          ["freezes", st.freezeCount || null, st.freezeCount > 0 ? "warn" : null],
+          ["freezes", st.freezeCount || null, st.freezeCount > 0 && !starved ? "warn" : null],
         ]);
         row.style.flexBasis = "100%";
         row.style.marginTop = "2px";

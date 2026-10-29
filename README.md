@@ -110,9 +110,11 @@ Rename is a move, not a relabel. The room id is in every client's URL and in eac
 
 The broadcaster and every viewer sample `getStats()` every 2s and send a summary up the socket; the server keeps only the newest sample per participant and `/admin` polls it at the same cadence. Nothing is stored or kept as history — it is a gauge, not a time series, and a sample older than 8s is dropped rather than shown stale.
 
-The broadcaster reports send bitrate, resolution, fps, mean encode time per frame, `qualityLimitationReason`, and how many parallel encodes it is running. Each viewer reports receive bitrate, fps, resolution, RTT, jitter, jitter-buffer delay and freeze count. Between them they separate the three different things that all get called "lag": **encode time** says the broadcaster's machine cannot keep up, **delay and freezes** say the network between them cannot, and **encodes Nx** says the mesh is the problem.
+The broadcaster reports send bitrate, resolution, encoded fps, the capture's own fps, encode time per frame, `qualityLimitationReason`, and how many parallel encodes it is running. Each viewer reports receive bitrate, fps, resolution, RTT, jitter, jitter-buffer delay and freezes. Between them they separate the four different things that all get called "lag": **encode time** says the broadcaster's machine cannot keep up, **delay and freezes** say the network between them cannot, **encodes Nx** says the mesh is the problem, and a **source fps** as low as the encoded fps says none of the above — the captured screen is idle or hidden and simply has no frames to give, which no tier can fix.
 
-Values that matter are coloured: encode time over 20ms, delay over 400ms, loss over 3%, fps under 15.
+Counters that only ever grow are read as intervals, not as lifetime averages: encode time comes from the frames encoded since the last sample, and freezes count the ones in that sample. A lifetime mean hides a machine that has recovered, and at a low frame rate it never escapes the expensive first keyframes.
+
+Values that matter are coloured: encode time over 20ms, delay over 400ms, loss over 3%, fps under 15 — except when the capture itself is below 5 fps, where a low frame rate is the screen being still and the card says so in words instead.
 
 `/admin` can also pin a quality tier, or cap bitrate and framerate outright. While a tier is pinned the monitor keeps measuring but stops steering, so an operator's choice is not undone six seconds later. Framerate is the cap that actually cuts latency on a screen share — halving fps halves what the encoder and the uplink have to keep up with, where a resolution change only shrinks each frame. Client-supplied numbers are coerced and clamped server-side before they ever reach the page.
 
