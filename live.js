@@ -1646,7 +1646,11 @@ const ADMIN_HTML = /* html */ `<!DOCTYPE html>
   .controls input { width: 78px; }
   /* Dialled in but not sent: the broadcaster is still on whatever was applied
      last, so the row says so rather than looking like the live setting. */
-  .controls.unapplied select, .controls.unapplied input { border-color: #6b5a1f; }
+  .controls.unapplied input { border-color: #6b5a1f; }
+  .tiers { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tiers .tier { padding: 6px 10px; border-radius: 6px; }
+  /* The tier the broadcaster was last told to hold. */
+  .tiers .tier.on { background: #2a2a2a; border-color: #5a5a5a; color: #fff; font-weight: 600; }
   .controls.unapplied .apply { border-color: #8a7325; color: #e9c95f; }
   .pinned { color: #d6a93e; }
   .viewers { margin-top: 12px; border-top: 1px solid #1f1f1f; padding-top: 10px; display: grid; gap: 6px; }
@@ -1855,61 +1859,82 @@ function roomCard(room, now) {
   }
 
   // --- quality controls ---
+  // A tier is one click, sent the moment it is clicked. It used to be a
+  // <select> plus Apply, and the list was being closed and reset under the
+  // cursor by the 2s poll; a button cannot be caught half-chosen.
   const controls = document.createElement("div");
   controls.className = "controls";
-  const tierSel = document.createElement("select");
-  for (const [value, label] of [["auto", "auto"], ["high", "high — 8 Mbps"], ["medium", "medium — 3 Mbps"],
-                                ["low", "low — 1 Mbps"], ["potato", "potato — 500 kbps"]]) {
-    const opt = document.createElement("option");
-    opt.value = value; opt.textContent = label;
-    tierSel.append(opt);
-  }
+
   const q = room.quality;
+  // room.quality.tier is the index the server stored, or the string "auto".
+  const activeTier = q ? (q.tier === "auto" ? "auto" : ["high","medium","low","potato"][q.tier] || "auto") : "auto";
+
   const draft = drafts.get(room.id);
   const bitrateIn = document.createElement("input");
   bitrateIn.type = "text"; bitrateIn.placeholder = "kbps";
   const fpsIn = document.createElement("input");
   fpsIn.type = "text"; fpsIn.placeholder = "fps";
-
   if (draft) {
-    tierSel.value = draft.tier;
     bitrateIn.value = draft.kbps;
     fpsIn.value = draft.fps;
-    controls.classList.add("unapplied");
   } else {
-    // room.quality.tier is the index the server stored, or the string "auto".
-    tierSel.value = q ? (q.tier === "auto" ? "auto" : ["high","medium","low","potato"][q.tier] || "auto") : "auto";
     if (q && q.maxBitrate) bitrateIn.value = String(Math.round(q.maxBitrate / 1000));
     if (q && q.maxFramerate) fpsIn.value = String(q.maxFramerate);
   }
 
+  // Caps are typed, so they can be mid-edit when a poll lands and have to be
+  // kept across the rebuild; they go out with whichever tier is clicked next,
+  // or on Apply on their own.
   const noteDraft = () => {
-    drafts.set(room.id, { tier: tierSel.value, kbps: bitrateIn.value, fps: fpsIn.value });
+    drafts.set(room.id, { kbps: bitrateIn.value, fps: fpsIn.value });
     controls.classList.add("unapplied");
   };
-  tierSel.onchange = noteDraft;
   bitrateIn.oninput = noteDraft;
   fpsIn.oninput = noteDraft;
 
-  const apply = document.createElement("button");
-  apply.className = "apply";
-  apply.textContent = "Apply";
-  apply.disabled = !room.live;
-  apply.onclick = () => act("Quality applied to " + room.id,
+  const sendQuality = (tier, message) => act(message,
     "/rooms/" + encodeURIComponent(room.id) + "/quality",
     { method: "POST", body: {
-        tier: tierSel.value,
+        tier: tier,
         maxBitrate: bitrateIn.value ? Math.round(parseFloat(bitrateIn.value) * 1000) : null,
         maxFramerate: fpsIn.value ? parseInt(fpsIn.value, 10) : null,
       } },
-    // Only once it has landed: a rejected apply keeps the dialled-in values on
-    // screen next to the error, rather than silently snapping back.
+    // Only once it has landed: a rejected send keeps the typed caps on screen
+    // next to the error, rather than silently snapping back.
     () => drafts.delete(room.id));
+
   const lbl = document.createElement("span");
   lbl.textContent = "quality";
+  controls.append(lbl);
+
+  const tiers = document.createElement("div");
+  tiers.className = "tiers";
+  for (const [value, label, note] of [["auto", "auto", "let the broadcaster steer itself"],
+                                      ["high", "high", "8 Mbps"], ["medium", "medium", "3 Mbps"],
+                                      ["low", "low", "1 Mbps"], ["potato", "potato", "500 kbps"]]) {
+    const b = document.createElement("button");
+    b.className = "tier" + (value === activeTier ? " on" : "");
+    b.textContent = label;
+    b.title = note;
+    b.disabled = !room.live;
+    b.onclick = () => {
+      // Paint it straight away. The confirming poll is up to two seconds out,
+      // and a button that looks inert for that long invites a second click.
+      for (const other of tiers.children) other.classList.toggle("on", other === b);
+      sendQuality(value, room.id + " set to " + label);
+    };
+    tiers.append(b);
+  }
+  controls.append(tiers);
+
   const capLbl = document.createElement("span");
   capLbl.textContent = "caps";
-  controls.append(lbl, tierSel, capLbl, bitrateIn, fpsIn, apply);
+  const apply = document.createElement("button");
+  apply.className = "apply";
+  apply.textContent = "Apply caps";
+  apply.disabled = !room.live;
+  apply.onclick = () => sendQuality(activeTier, "Caps applied to " + room.id);
+  controls.append(capLbl, bitrateIn, fpsIn, apply);
   card.append(controls);
 
   if (room.viewers.length) {
@@ -2012,34 +2037,16 @@ function updateStats(state, now) {
     + " · " + state.server.memoryMb + " MB";
 }
 
-// A focused <input> is one the operator is typing a cap into, so it waits.
-// A focused <select> is not enough on its own -- it keeps focus after a value
-// is picked, and holding on that would freeze the panel for good. What has to
-// be waited out is the open popup, so the open is tracked explicitly, with a
-// deadline in case a dismissal arrives as neither change nor blur.
-let selectOpenAt = 0;
-const SELECT_OPEN_MAX_MS = 20000;
-
+// A focused <input> is a cap being typed: rebuilding the card under it would
+// take the caret with it, so the redraw waits. Buttons never hold -- they
+// carry no half-finished state, and the refresh after a click has to land.
 function holdingRedraw() {
   const held = document.activeElement;
-  if (!held || !roomsEl.contains(held)) return false;
-  if (held.tagName === "INPUT") return true;
-  return held.tagName === "SELECT" && selectOpenAt > 0 && Date.now() - selectOpenAt < SELECT_OPEN_MAX_MS;
+  return Boolean(held && roomsEl.contains(held) && held.tagName === "INPUT");
 }
 
-roomsEl.addEventListener("mousedown", (e) => {
-  if (e.target.tagName === "SELECT") selectOpenAt = Date.now();
-});
-roomsEl.addEventListener("keydown", (e) => {
-  if (e.target.tagName === "SELECT") selectOpenAt = e.key === "Escape" ? 0 : Date.now();
-});
-roomsEl.addEventListener("change", () => { selectOpenAt = 0; resumeRedraw(); });
-
-// Pick the deferred redraw back up the moment the control is released.
-roomsEl.addEventListener("focusout", (e) => {
-  if (e.target.tagName === "SELECT") selectOpenAt = 0;
-  resumeRedraw();
-});
+// Pick the deferred redraw back up the moment the field is released.
+roomsEl.addEventListener("focusout", resumeRedraw);
 
 function resumeRedraw() {
   // Let focus settle first: focusout fires before the next element has it, and

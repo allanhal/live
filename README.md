@@ -144,7 +144,7 @@ Counters that only ever grow are read as intervals, not as lifetime averages: en
 
 Values that matter are coloured: encode time over 20ms, delay over 400ms, loss over 3%, fps under 15 — except when the capture itself is below 5 fps, where a low frame rate is the screen being still and the card says so in words instead.
 
-`/admin` can also pin a quality tier, or cap bitrate and framerate outright. While a tier is pinned the monitor keeps measuring but stops steering, so an operator's choice is not undone six seconds later. Framerate is the cap that actually cuts latency on a screen share — halving fps halves what the encoder and the uplink have to keep up with, where a resolution change only shrinks each frame. Client-supplied numbers are coerced and clamped server-side before they ever reach the page.
+`/admin` can also pin a quality tier, or cap bitrate and framerate outright. Each tier is a button that sends on the click — the panel rebuilds every room card on a 2s poll, so a `<select>` there was closed and reset under the cursor before it could be applied. Typed caps are held across those rebuilds until they are sent, since the server has not been told about them yet and the rebuild has nothing to restore them from. While a tier is pinned the monitor keeps measuring but stops steering, so an operator's choice is not undone six seconds later. Framerate is the cap that actually cuts latency on a screen share — halving fps halves what the encoder and the uplink have to keep up with, where a resolution change only shrinks each frame. Client-supplied numbers are coerced and clamped server-side before they ever reach the page.
 
 ## Known limitations
 
