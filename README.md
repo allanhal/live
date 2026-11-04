@@ -96,6 +96,34 @@ A broadcaster leaving does **not** evict the viewers — they stay connected and
 
 A viewer's stream starts muted, because an unmuted `play()` is blocked by autoplay policy and the result is a black frame rather than a prompt. The viewer gets a mute toggle and a volume slider over the bottom-right of the video; the first move of either one is the unmute, and the level is kept in `localStorage` so the next room opens at the same volume. A level of 0 is not stored — otherwise a visit that ended silent would start the next one silent with nothing to explain it.
 
+## Recording
+
+Either side can record, and the two takes are deliberately not the same picture.
+
+The **broadcaster** records `localStream` — the capture as it comes off the screen, before any peer connection has seen it. Full resolution and frame rate, untouched by whatever tier the monitor may have dropped the viewers to. A **viewer** records what actually arrived: tier drops, freezes and all. That is useless as an archive and exactly what you want when someone says the stream was unwatchable.
+
+A ⏺ button appears in the bottom-left of the video once there is something to record, opposite the volume control. While recording it shows elapsed time and, once the container has flushed something, bytes written.
+
+Video stays where it already was. Nothing in this feature sends a byte to the server, so the one claim the architecture makes survives recording. The cost falls on the broadcaster and it is one more encode — the same price as one more viewer joining, and visible in `/admin` as the `encodes Nx` figure.
+
+### Where the bytes go
+
+With the File System Access API the browser asks where to save *before* recording starts, and each chunk is written straight to that file as it arrives, so memory stays flat however long the session runs. An hour of 1080p is well past a gigabyte, which is why this path exists: the fallback buffers the whole take in the tab and hands over a `Blob` at the end, and that is all Firefox and Safari can do.
+
+`write()` is async and chunks arrive on a timer, so they are queued rather than fired off — two overlapping writes to one writable interleave bytes.
+
+MP4 is preferred over WebM because a `.webm` is a file most people can do nothing with. The cost is that the timeslice is a request, not a promise, and the containers answer it differently: WebM honours it to the millisecond (12 chunks of ~80 KB over 12s), while the MP4 muxer ignores it and flushes whole fragments instead (4 chunks over the same 12s, arriving at 5.1s and 10.2s, the largest 908 KB). Memory holds one fragment either way, but an MP4 take reaches the disk in ~5s steps rather than 1s ones.
+
+### What a recording does not survive
+
+A reload. The file sink writes into a swap file the browser only commits on `close()`, so a take that is never stopped is a take that never lands. Leaving the page while recording therefore raises a confirm, and `pagehide` makes a best-effort stop — `stop()` and `close()` are both async and the page may not last long enough, which is what makes the confirm worth its annoyance.
+
+Stopping the share from the browser's own bar is **not** one of these cases: every track ending fires `onstop` by itself, and the take is finalised normally.
+
+### Not done
+
+Viewers are not told when the broadcaster is recording, and the broadcaster is not told when a viewer is. Both recordings are local to the machine that made them and nothing about them crosses the socket, so showing an indicator means sending state the server does not currently carry.
+
 ## Admin panel
 
 `GET /admin` is a password-gated panel over the live room map. The password is `1111` by default — set `ADMIN_PASSWORD` anywhere the server is reachable from outside, because this page can end every stream on it. The password is sent as an `x-admin-password` header on each API call and held in `sessionStorage`, so it is gone when the tab is; eight wrong tries lock an IP out of `/admin/api/*` for a minute.

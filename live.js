@@ -665,6 +665,23 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
   #volume.muted #volume-slider { background: #333; }
   #volume.muted #volume-slider::-webkit-slider-thumb { background: #777; }
   #volume.muted #volume-slider::-moz-range-thumb { background: #777; }
+  /* The opposite corner from #volume, on the same plate and for the same
+     reason: it sits over the video and has to stay readable on a white frame
+     as well as a dark one. */
+  #record {
+    position: absolute; bottom: 16px; left: 16px;
+    display: none; align-items: center; gap: 10px;
+    padding: 8px 14px; z-index: 3;
+    background: rgba(18, 18, 18, 0.82); border-radius: 6px;
+    backdrop-filter: blur(4px);
+  }
+  #record-btn {
+    padding: 0; font-size: 18px; line-height: 1;
+    background: none; color: #e0e0e0; border: none;
+    cursor: pointer;
+  }
+  #record.recording #record-btn { color: #e53e3e; }
+  #record-meter { font-size: 12px; color: #999; font-variant-numeric: tabular-nums; }
   #waiting {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     color: #888; font-size: 16px;
@@ -687,6 +704,10 @@ const PAGE_HTML = /* html */ `<!DOCTYPE html>
     <input id="volume-slider" type="range" min="0" max="100" value="100"
            aria-label="Volume" title="Volume">
   </div>
+  <div id="record">
+    <button id="record-btn" title="Record" aria-label="Record">⏺</button>
+    <span id="record-meter"></span>
+  </div>
 </div>
 
 <div id="info"></div>
@@ -702,6 +723,9 @@ const viewersEl = document.getElementById("viewers-count");
 const volumeEl = document.getElementById("volume");
 const muteBtn = document.getElementById("mute-btn");
 const volumeSlider = document.getElementById("volume-slider");
+const recordEl = document.getElementById("record");
+const recordBtn = document.getElementById("record-btn");
+const recordMeter = document.getElementById("record-meter");
 
 let role = null;
 let ws = null;
@@ -757,6 +781,7 @@ function connect() {
           if (localStream) {
             startBtn.style.display = "none";
             setStatus("green", "Broadcasting");
+            showRecordControl();
           } else {
             startBtn.style.display = "block";
             setStatus("yellow", "Ready to broadcast — click Share Screen");
@@ -818,6 +843,8 @@ function connect() {
         break;
 
       case "broadcaster-left":
+        stopRecording();
+        hideRecordControl();
         video.srcObject = null;
         waitingEl.style.display = "block";
         setStatus("red", "Broadcaster disconnected");
@@ -901,6 +928,8 @@ function endSession(message) {
   video.srcObject = null;
   startBtn.style.display = "none";
   volumeEl.style.display = "none";
+  stopRecording();
+  hideRecordControl();
   waitingEl.textContent = message;
   waitingEl.style.display = "block";
   viewersEl.textContent = "";
@@ -920,6 +949,7 @@ startBtn.addEventListener("click", async () => {
     video.muted = true;
     startBtn.style.display = "none";
     setStatus("green", "Broadcasting");
+    showRecordControl();
 
     // Connect anyone who was already in the room before we started sharing.
     for (const viewerId of waitingViewers) await createPeerForViewer(viewerId);
@@ -928,6 +958,9 @@ startBtn.addEventListener("click", async () => {
 
     localStream.getVideoTracks()[0].onended = () => {
       setStatus("red", "Screen share stopped");
+      // Finalise the take before the stream it was reading disappears.
+      stopRecording();
+      hideRecordControl();
       for (const [, pc] of peerConnections) pc.close();
       peerConnections.clear();
       stopQualityMonitor();
@@ -1149,12 +1182,16 @@ async function handleOffer(offer) {
   viewerPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
   viewerPC.ontrack = (e) => {
+    // A renegotiation hands over a new stream and ends the old one, so a take
+    // in progress belongs to a picture that no longer exists.
+    stopRecording();
     video.srcObject = e.streams[0] || new MediaStream([e.track]);
     // A new stream has to start muted to autoplay, so put the control back in
     // its muted state rather than leaving it showing sound that is not playing.
     applyVolume(lastVolume, true);
     waitingEl.style.display = "none";
     setStatus("green", "Watching stream");
+    showRecordControl();
     startViewerStats();
     video.play().then(() => {
       if (role === "viewer") volumeEl.style.display = "flex";
@@ -1269,6 +1306,251 @@ volumeSlider.addEventListener("input", () => {
 });
 
 applyVolume(lastVolume, true);
+
+// --- Recording ---
+
+// Two taps on one session, and deliberately not the same picture. The
+// broadcaster records localStream, the capture before any peer connection has
+// seen it: full resolution and frame rate, untouched by whatever tier the
+// monitor may have dropped the viewers to. A viewer records what actually
+// arrived -- tier drops, freezes and all -- which is useless as an archive and
+// exactly what you want when someone says the stream was unwatchable.
+//
+// Either way the video stays where it already was. Nothing here sends a byte
+// to the server, so the one claim this architecture makes survives recording.
+// The cost is on the broadcaster, and it is one more encode: the same price as
+// one more viewer joining, and visible in /admin as the encodes count.
+
+// First supported wins. MP4 leads because a .webm is a file most people can do
+// nothing with; the webm entries are for a MediaRecorder with no MP4 muxer.
+const RECORD_TYPES = [
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4",
+  "video/webm;codecs=vp9,opus",
+  "video/webm;codecs=vp8,opus",
+  "video/webm",
+];
+
+// The timeslice is what makes ondataavailable fire more than once. Without it
+// the whole recording is a single Blob handed over at stop, which is the memory
+// problem the file sink exists to avoid.
+//
+// It is a request, not a promise, and the two containers answer it differently.
+// WebM honours it to the millisecond: measured at 12 chunks of ~80 KB over 12s.
+// The MP4 muxer ignores it and flushes whole fragments instead -- over the same
+// 12s, 4 chunks arriving at 5.1s and 10.2s, the largest 908 KB. Either way
+// memory holds one fragment rather than the whole take, which is the part that
+// matters here, but it does mean an MP4 recording reaches the disk in ~5s steps
+// and loses up to that much if the tab dies, and that the byte count in the
+// meter moves in jumps rather than smoothly.
+const RECORD_CHUNK_MS = 1000;
+
+let recorder = null;
+let recordSink = null;
+let recordName = "";
+let recordBytes = 0;
+let recordStartedAt = 0;
+let recordTicker = null;
+
+function recordType() {
+  if (!window.MediaRecorder) return "";
+  for (const type of RECORD_TYPES) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
+
+// Two sinks behind one interface. The first streams every chunk to a file the
+// user picked, so memory stays flat however long the session runs; the second
+// buffers in the tab and hands back a Blob at the end, which is all a browser
+// without the File System Access API can do. An hour of 1080p is well past a
+// gigabyte, so the streaming one is why a long recording is possible at all.
+async function openFileSink(name, mime, ext) {
+  const accept = {};
+  accept[mime] = ["." + ext];
+  const handle = await showSaveFilePicker({
+    suggestedName: name,
+    types: [{ description: "Video", accept }],
+  });
+  const file = await handle.createWritable();
+  // write() is async and the chunks arrive on a timer, so they are queued
+  // rather than fired off: two overlapping writes to one writable interleave.
+  let tail = Promise.resolve();
+  return {
+    write(chunk) { tail = tail.then(() => file.write(chunk)).catch(() => {}); },
+    async close() { await tail; await file.close(); return null; },
+    async abort() { try { await tail; await file.abort(); } catch {} },
+  };
+}
+
+function openMemorySink(mime) {
+  const parts = [];
+  return {
+    write(chunk) { parts.push(chunk); },
+    async close() { return new Blob(parts, { type: mime }); },
+    async abort() { parts.length = 0; },
+  };
+}
+
+async function startRecording() {
+  if (recorder) return;
+  const stream = role === "broadcaster" ? localStream : video.srcObject;
+  const type = recordType();
+  if (!stream || !type) return;
+
+  const isMp4 = type.indexOf("mp4") !== -1;
+  const ext = isMp4 ? "mp4" : "webm";
+  const mime = isMp4 ? "video/mp4" : "video/webm";
+  const name = "live-" + ROOM_ID + (role === "viewer" ? "-viewer" : "") +
+               "-" + recordStamp() + "." + ext;
+
+  // showSaveFilePicker spends the click's user activation, so it has to be the
+  // first thing this handler awaits -- anything awaited ahead of it makes the
+  // call throw instead of opening a dialog.
+  try {
+    recordSink = window.showSaveFilePicker
+      ? await openFileSink(name, mime, ext)
+      : openMemorySink(mime);
+  } catch (err) {
+    // AbortError is the user closing the dialog, and that is a no. Anything
+    // else means the picker is present but unusable, where an in-memory take
+    // beats no take.
+    if (err && err.name === "AbortError") { recordSink = null; return; }
+    recordSink = openMemorySink(mime);
+  }
+
+  try {
+    recorder = new MediaRecorder(stream, { mimeType: type });
+  } catch {
+    recordSink.abort();
+    recordSink = null;
+    recordNote("cannot record this stream");
+    return;
+  }
+
+  recordName = name;
+  recordBytes = 0;
+  recordStartedAt = Date.now();
+
+  recorder.ondataavailable = (e) => {
+    if (!e.data || !e.data.size) return;
+    recordBytes += e.data.size;
+    recordSink.write(e.data);
+  };
+  // Fires on stop() and also on its own once every track has ended, so a take
+  // still lands when the share is stopped from the browser's own bar.
+  recorder.onstop = finishRecording;
+  recorder.start(RECORD_CHUNK_MS);
+
+  recordEl.classList.add("recording");
+  recordBtn.textContent = "⏹";
+  setRecordLabel("Stop recording");
+  recordTick();
+  recordTicker = setInterval(recordTick, 1000);
+}
+
+function stopRecording() {
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+async function finishRecording() {
+  const sink = recordSink;
+  const name = recordName;
+  recorder = null;
+  recordSink = null;
+  clearInterval(recordTicker);
+  recordTicker = null;
+  recordEl.classList.remove("recording");
+  recordBtn.textContent = "⏺";
+  setRecordLabel("Record");
+  recordMeter.textContent = "";
+  if (!sink) return;
+  try {
+    // The memory sink hands back a Blob to download. The file sink wrote every
+    // chunk as it arrived and has nothing left to give.
+    const blob = await sink.close();
+    if (blob) download(blob, name);
+  } catch {
+    recordNote("saving failed");
+  }
+}
+
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  // Revoking straight away can cancel a download still being written.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+// A recording in progress is the one thing on this page that a reload destroys.
+// The file sink writes into a swap file the browser only commits on close(), so
+// a take that is never stopped is a take that never lands.
+window.addEventListener("beforeunload", (e) => {
+  if (!recorder) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
+
+// Best effort on a navigation that is already happening: stop() and close() are
+// async and the page may not last long enough, which is what makes the confirm
+// above worth its annoyance.
+window.addEventListener("pagehide", stopRecording);
+
+recordBtn.addEventListener("click", () => {
+  if (recorder) stopRecording();
+  else startRecording();
+});
+
+function showRecordControl() {
+  // Nothing here can record, so do not offer it.
+  if (!recordType()) return;
+  recordEl.style.display = "flex";
+}
+
+function hideRecordControl() {
+  recordEl.style.display = "none";
+}
+
+function setRecordLabel(action) {
+  recordBtn.title = action;
+  recordBtn.setAttribute("aria-label", action);
+}
+
+function recordTick() {
+  const secs = Math.floor((Date.now() - recordStartedAt) / 1000);
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+  // The clock is the liveness signal, so it stands on its own until there is a
+  // size worth printing. An MP4 take writes nothing at all for its first few
+  // seconds, and a steady "0.0 MB" beside a running clock reads as a recording
+  // that is failing rather than one that has not flushed a fragment yet.
+  const mb = recordBytes / 1e6;
+  const size = recordBytes === 0 ? ""
+    : " · " + (mb < 1000 ? mb.toFixed(1) + " MB" : (mb / 1000).toFixed(2) + " GB");
+  recordMeter.textContent = mm + ":" + ss + size;
+}
+
+// The meter is the only place a recording can say anything. setStatus belongs to
+// the stream, and overwriting it would report a failed save as a failed stream.
+function recordNote(text) {
+  recordMeter.textContent = text;
+  setTimeout(() => {
+    if (!recorder && recordMeter.textContent === text) recordMeter.textContent = "";
+  }, 5000);
+}
+
+// Down to the second, because minutes are not enough: two takes from one
+// session are a normal thing to want, and at minute resolution the second one
+// suggests a name that silently overwrites the first.
+function recordStamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+         "-" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+}
 
 // --- UI helpers ---
 
