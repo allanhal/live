@@ -1702,6 +1702,7 @@ const msgEl = document.getElementById("msg");
 const PW_KEY = "live:admin-pw";
 let password = null;
 let timer = null;
+let redrawPending = false;
 
 function say(text, kind) {
   msgEl.textContent = text || "";
@@ -1940,6 +1941,20 @@ async function refresh() {
   }
 
   const now = state.server.now;
+
+  // Never rebuild the room list out from under a control the operator is
+  // using. The cards are thrown away and recreated on every poll, so an open
+  // <select> popup was being closed within a second or two of opening it, and
+  // a half-typed cap was wiped. Focus stays on a select while its native popup
+  // is open, so this covers both. Buttons are not deferred on -- they hold no
+  // state, and Apply needs its refresh to land right away.
+  if (holdingRedraw()) {
+    redrawPending = true;
+    updateStats(state, now);
+    return;
+  }
+  redrawPending = false;
+
   roomsEl.textContent = "";
   if (!state.rooms.length) {
     const empty = document.createElement("div");
@@ -1950,10 +1965,49 @@ async function refresh() {
     for (const room of state.rooms) roomsEl.append(roomCard(room, now));
   }
 
+  updateStats(state, now);
+}
+
+function updateStats(state, now) {
   statsEl.textContent = state.rooms.length + " room" + (state.rooms.length === 1 ? "" : "s")
     + " · " + state.server.clients + " socket" + (state.server.clients === 1 ? "" : "s")
     + " · up " + ago(now - state.server.uptime * 1000, now)
     + " · " + state.server.memoryMb + " MB";
+}
+
+// A focused <input> is one the operator is typing a cap into, so it waits.
+// A focused <select> is not enough on its own -- it keeps focus after a value
+// is picked, and holding on that would freeze the panel for good. What has to
+// be waited out is the open popup, so the open is tracked explicitly, with a
+// deadline in case a dismissal arrives as neither change nor blur.
+let selectOpenAt = 0;
+const SELECT_OPEN_MAX_MS = 20000;
+
+function holdingRedraw() {
+  const held = document.activeElement;
+  if (!held || !roomsEl.contains(held)) return false;
+  if (held.tagName === "INPUT") return true;
+  return held.tagName === "SELECT" && selectOpenAt > 0 && Date.now() - selectOpenAt < SELECT_OPEN_MAX_MS;
+}
+
+roomsEl.addEventListener("mousedown", (e) => {
+  if (e.target.tagName === "SELECT") selectOpenAt = Date.now();
+});
+roomsEl.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") selectOpenAt = e.key === "Escape" ? 0 : Date.now();
+});
+roomsEl.addEventListener("change", () => { selectOpenAt = 0; resumeRedraw(); });
+
+// Pick the deferred redraw back up the moment the control is released.
+roomsEl.addEventListener("focusout", (e) => {
+  if (e.target.tagName === "SELECT") selectOpenAt = 0;
+  resumeRedraw();
+});
+
+function resumeRedraw() {
+  // Let focus settle first: focusout fires before the next element has it, and
+  // tabbing from the kbps box to the fps box must not count as leaving.
+  setTimeout(() => { if (redrawPending && !holdingRedraw()) refresh(); }, 0);
 }
 
 function startPolling() {
