@@ -1644,6 +1644,10 @@ const ADMIN_HTML = /* html */ `<!DOCTYPE html>
     background: #0e0e0e; color: #e0e0e0; font-size: 12px;
   }
   .controls input { width: 78px; }
+  /* Dialled in but not sent: the broadcaster is still on whatever was applied
+     last, so the row says so rather than looking like the live setting. */
+  .controls.unapplied select, .controls.unapplied input { border-color: #6b5a1f; }
+  .controls.unapplied .apply { border-color: #8a7325; color: #e9c95f; }
   .pinned { color: #d6a93e; }
   .viewers { margin-top: 12px; border-top: 1px solid #1f1f1f; padding-top: 10px; display: grid; gap: 6px; }
   .viewer { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #999; }
@@ -1703,6 +1707,12 @@ const PW_KEY = "live:admin-pw";
 let password = null;
 let timer = null;
 let redrawPending = false;
+
+// What the operator has dialled in but not yet applied, per room. The cards
+// are rebuilt from server state every poll, so without this a tier picked and
+// not yet applied was reverted under the cursor within two seconds -- and the
+// server has not been told about it, so it cannot be read back from /state.
+const drafts = new Map();
 
 function say(text, kind) {
   msgEl.textContent = text || "";
@@ -1855,14 +1865,34 @@ function roomCard(room, now) {
     tierSel.append(opt);
   }
   const q = room.quality;
-  tierSel.value = q ? (q.tier === "auto" ? "auto" : ["high","medium","low","potato"][q.tier] || "auto") : "auto";
+  const draft = drafts.get(room.id);
   const bitrateIn = document.createElement("input");
   bitrateIn.type = "text"; bitrateIn.placeholder = "kbps";
-  if (q && q.maxBitrate) bitrateIn.value = String(Math.round(q.maxBitrate / 1000));
   const fpsIn = document.createElement("input");
   fpsIn.type = "text"; fpsIn.placeholder = "fps";
-  if (q && q.maxFramerate) fpsIn.value = String(q.maxFramerate);
+
+  if (draft) {
+    tierSel.value = draft.tier;
+    bitrateIn.value = draft.kbps;
+    fpsIn.value = draft.fps;
+    controls.classList.add("unapplied");
+  } else {
+    // room.quality.tier is the index the server stored, or the string "auto".
+    tierSel.value = q ? (q.tier === "auto" ? "auto" : ["high","medium","low","potato"][q.tier] || "auto") : "auto";
+    if (q && q.maxBitrate) bitrateIn.value = String(Math.round(q.maxBitrate / 1000));
+    if (q && q.maxFramerate) fpsIn.value = String(q.maxFramerate);
+  }
+
+  const noteDraft = () => {
+    drafts.set(room.id, { tier: tierSel.value, kbps: bitrateIn.value, fps: fpsIn.value });
+    controls.classList.add("unapplied");
+  };
+  tierSel.onchange = noteDraft;
+  bitrateIn.oninput = noteDraft;
+  fpsIn.oninput = noteDraft;
+
   const apply = document.createElement("button");
+  apply.className = "apply";
   apply.textContent = "Apply";
   apply.disabled = !room.live;
   apply.onclick = () => act("Quality applied to " + room.id,
@@ -1871,7 +1901,10 @@ function roomCard(room, now) {
         tier: tierSel.value,
         maxBitrate: bitrateIn.value ? Math.round(parseFloat(bitrateIn.value) * 1000) : null,
         maxFramerate: fpsIn.value ? parseInt(fpsIn.value, 10) : null,
-      } });
+      } },
+    // Only once it has landed: a rejected apply keeps the dialled-in values on
+    // screen next to the error, rather than silently snapping back.
+    () => drafts.delete(room.id));
   const lbl = document.createElement("span");
   lbl.textContent = "quality";
   const capLbl = document.createElement("span");
@@ -1920,9 +1953,10 @@ function roomCard(room, now) {
   return card;
 }
 
-async function act(successMessage, path, options) {
+async function act(successMessage, path, options, onOk) {
   try {
     await api(path, options);
+    if (onOk) onOk();
     say(successMessage, "ok");
   } catch (err) {
     say(err.message, "err");
@@ -1954,6 +1988,9 @@ async function refresh() {
     return;
   }
   redrawPending = false;
+
+  const ids = new Set(state.rooms.map((r) => r.id));
+  for (const id of drafts.keys()) if (!ids.has(id)) drafts.delete(id);
 
   roomsEl.textContent = "";
   if (!state.rooms.length) {
